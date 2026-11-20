@@ -99,6 +99,10 @@ class BioTests(unittest.TestCase):
             self.assertIn("OPSEC", text[:90])
             self.assertTrue(any(char.isdigit() for char in text))
             self.assertIn("_", text)
+            self.assertTrue(all(char.isalnum() or char == "_" for char in text))
+            lowered = text.lower()
+            for fragment in ("hack", "cheat", "discord", "robux", "#", "*", "/"):
+                self.assertNotIn(fragment, lowered)
 
 
 class OutfitTests(unittest.TestCase):

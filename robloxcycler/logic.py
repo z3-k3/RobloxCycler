@@ -380,55 +380,105 @@ _BIO_STEMS = (
     "SYSTEM",
     "UNKNOWN",
     "VOID",
-    "ACCESS",
-    "ERROR",
     "SIGNAL",
     "LOST",
     "NULL",
     "TRACE",
-    "KERNEL",
     "BUFFER",
     "PACKET",
     "OFFSET",
     "SECTOR",
-    "HASH",
     "NODE",
     "RELAY",
-    "CIPHER",
-    "GHOST",
     "STATIC",
     "FRAME",
-    "DUMP",
-    "STACK",
-    "OPCODE",
     "SEGMENT",
-    "CHECKSUM",
+    "VECTOR",
+    "MODULE",
+    "INDEX",
+    "LEVEL",
+    "PHASE",
+    "PULSE",
+    "RANGE",
+    "TIMER",
+    "COUNT",
+    "LABEL",
 )
-_BIO_SYMBOLS = "_|/\\#*+=~^[]<>"
+# Fragments Roblox's text filter commonly tags, including ones a random token can spell by accident.
+_BIO_BLOCKED = (
+    "ass",
+    "damn",
+    "hell",
+    "shit",
+    "fuck",
+    "bitch",
+    "dick",
+    "cock",
+    "sex",
+    "porn",
+    "nude",
+    "slut",
+    "rape",
+    "nazi",
+    "kill",
+    "hate",
+    "hack",
+    "cheat",
+    "exploit",
+    "robux",
+    "scam",
+    "discord",
+    "bypass",
+)
 
 
 def glitch_bio(length: int | None = None, rng: random.Random | None = None) -> str:
-    """One line of fresh terminal noise, 500 to 1000 characters, with OPSEC near the start."""
+    """One line of fresh terminal noise, 500 to 1000 characters, with OPSEC near the start.
+
+    Letters, digits, and underscores only. Chunks that spell a filtered fragment are dropped.
+    """
     picker = rng or random.SystemRandom()
     target = picker.randint(500, 1000) if length is None else length
     target = min(1000, max(500, int(target)))
+    for _ in range(30):
+        text = _assemble_bio(picker, target)
+        if _bio_is_plain(text) and "OPSEC" in text[:90]:
+            return text
+    return ("NULL_" * 200)[:target]
+
+
+def _assemble_bio(rng: random.Random, target: int) -> str:
     chunks: list[str] = []
     built = 0
     while built < target:
-        chunk = _glitch_chunk(picker)
+        chunk = _safe_chunk(rng)
         chunks.append(chunk)
         built += len(chunk)
     text = "".join(chunks)
-    spot = picker.randint(0, 80)
+    spot = rng.randint(0, 80)
     text = text[:spot] + "OPSEC" + text[spot:]
-    text = text.replace("\n", "").replace("\r", "")
     if len(text) < target:
-        text += _glitch_chunk(picker)
+        text += _safe_chunk(rng)
     return text[:target]
 
 
+def _safe_chunk(rng: random.Random) -> str:
+    for _ in range(20):
+        chunk = _glitch_chunk(rng)
+        if _bio_is_plain(chunk):
+            return chunk
+    return f"NULL_{rng.randint(0, 9999):04d}_"
+
+
+def _bio_is_plain(text: str) -> bool:
+    if any(not (char.isalnum() or char == "_") for char in text):
+        return False
+    lowered = text.lower()
+    return not any(fragment in lowered for fragment in _BIO_BLOCKED)
+
+
 def _glitch_chunk(rng: random.Random) -> str:
-    kind = rng.randrange(6)
+    kind = rng.randrange(4)
     if kind == 0:
         left = _noise_token(rng, 3, 8)
         right = _noise_token(rng, 3, 8)
@@ -438,13 +488,7 @@ def _glitch_chunk(rng: random.Random) -> str:
         return f"{_cased_stem(rng)}_{_cased_stem(rng)}_{rng.randint(0, 9999):03d}"
     if kind == 2:
         return "NULL_" * rng.randint(2, 4) + f"{rng.randint(0, 99):02d}"
-    if kind == 3:
-        digits = "".join(rng.choice(string.digits) for _ in range(rng.randint(3, 6)))
-        return f"ERROR_{digits}"
-    if kind == 4:
-        body = _noise_token(rng, 8, 24)
-        return rng.choice(_BIO_SYMBOLS) + body + rng.choice(_BIO_SYMBOLS)
-    return _cased_stem(rng) + rng.choice(_BIO_SYMBOLS) + _noise_token(rng, 2, 6)
+    return _cased_stem(rng) + "_" + _noise_token(rng, 2, 6)
 
 
 def _noise_token(rng: random.Random, shortest: int, longest: int) -> str:
