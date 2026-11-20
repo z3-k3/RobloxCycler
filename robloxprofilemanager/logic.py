@@ -523,24 +523,43 @@ def parse_avatar_rules(payload: Any) -> dict[str, Any]:
     return {"scales": scales, "limits": limits, "colors": colors}
 
 
+def asset_ids_from_outfit(payload: Any) -> set[int]:
+    """Asset ids worn by one saved outfit. Used so the random look cannot rebuild it."""
+    if not isinstance(payload, dict):
+        return set()
+    model = payload.get("outfitModel") if isinstance(payload.get("outfitModel"), dict) else payload
+    assets = model.get("assets") if isinstance(model, dict) else None
+    found: set[int] = set()
+    if not isinstance(assets, list):
+        return found
+    for asset in assets:
+        if not isinstance(asset, dict):
+            continue
+        raw_id = asset.get("id", asset.get("assetId"))
+        if isinstance(raw_id, int) and not isinstance(raw_id, bool):
+            found.add(raw_id)
+    return found
+
+
 def freaky_avatar(
     grouped: dict[int, list[int]],
     rules: dict[str, Any],
     rng: random.Random,
+    blocked: set[int] | None = None,
 ) -> dict[str, Any]:
     """One legal-but-wrong avatar: extreme sliders, clashing colors, every slot filled.
 
     Roblox rejects scales outside avatar rules, so each slider is only min or max.
-    `fallback` keeps the body parts and face when the piled-on version is refused.
+    Clothes and accessories from the saved outfits are left off. Body parts from
+    those outfits are used only when the account has no other part of that type.
     """
     scales = _extreme_scales(rules.get("scales") or {}, rng)
     colors = _clashing_colors(rules.get("colors") or [], rng)
     limits = rules.get("limits") if isinstance(rules.get("limits"), dict) else {}
-    full = _pick_assets(grouped, limits, rng, stacked=True)
-    plain = _pick_assets(grouped, limits, rng, stacked=False)
+    full = _pick_assets(grouped, limits, rng, stacked=True, blocked=blocked or set())
     return {
         "body": _avatar_body(full, scales, colors),
-        "fallback": _avatar_body(plain, scales, colors),
+        "fallback": _avatar_body(full, scales, colors),
         "scales": scales,
         "colors": colors,
         "asset_count": len(full),
@@ -592,12 +611,19 @@ def _pick_assets(
     rng: random.Random,
     *,
     stacked: bool,
+    blocked: set[int] | None = None,
 ) -> list[tuple[int, int]]:
     chosen: list[tuple[int, int]] = []
     used: set[int] = set()
+    banned = blocked or set()
 
-    def take(type_id: int, count: int) -> None:
+    def take(type_id: int, count: int, *, allow_banned: bool) -> None:
         pool = [asset_id for asset_id in grouped.get(type_id, []) if asset_id not in used]
+        fresh = [asset_id for asset_id in pool if asset_id not in banned]
+        if fresh:
+            pool = fresh
+        elif not allow_banned:
+            pool = []
         if count <= 0 or not pool:
             return
         rng.shuffle(pool)
@@ -608,10 +634,10 @@ def _pick_assets(
     head_type = 79 if grouped.get(79) and (not grouped.get(17) or rng.random() < 0.75) else 17
     if not grouped.get(head_type):
         head_type = 17 if grouped.get(17) else 79
-    take(head_type, 1)
+    take(head_type, 1, allow_banned=True)
     for type_id in BODY_PART_TYPES:
-        take(type_id, 1)
-    take(18, 1)
+        take(type_id, 1, allow_banned=True)
+    take(18, 1, allow_banned=True)
     if not stacked:
         return chosen
     for type_id in STACK_TYPES:
@@ -620,10 +646,10 @@ def _pick_assets(
             cap = int(cap)
         except (TypeError, ValueError):
             cap = 1
-        take(type_id, cap)
+        take(type_id, cap, allow_banned=False)
     if rng.random() < 0.35:
-        take(11, 1)
-        take(12, 1)
+        take(11, 1, allow_banned=False)
+        take(12, 1, allow_banned=False)
     return chosen
 
 

@@ -25,6 +25,7 @@ from robloxprofilemanager.logic import (
     badge_pause_seconds,
     absorb_wearables,
     add_owned_asset,
+    asset_ids_from_outfit,
     cookie_from_text,
     freaky_avatar,
     glitch_bio,
@@ -231,7 +232,7 @@ def run_loop(client: RobloxClient, selected: list[dict[str, Any]], config: dict[
         if random_mode:
             if wardrobe is None:
                 try:
-                    wardrobe = _load_wardrobe(client)
+                    wardrobe = _load_wardrobe(client, config["outfit_ids"])
                 except RobloxError as exc:
                     if exc.transient:
                         print(f"{exc} Waiting {interval:.0f}s.")
@@ -241,10 +242,15 @@ def run_loop(client: RobloxClient, selected: list[dict[str, Any]], config: dict[
                     print(exc)
                     _log(f"auth-stop {exc}")
                     return 1
-            look = freaky_avatar(wardrobe["assets"], wardrobe["rules"], random.SystemRandom())
+            look = freaky_avatar(
+                wardrobe["assets"],
+                wardrobe["rules"],
+                random.SystemRandom(),
+                wardrobe.get("blocked"),
+            )
             outfit = {"id": 0, "name": _look_label(look)}
             try:
-                result = client.wear_body(look["body"], look["fallback"])
+                result = client.wear_body(look["body"])
                 _forget_assets(wardrobe, result.removed_ids)
             except RobloxError as exc:
                 if exc.transient:
@@ -374,7 +380,7 @@ def run_loop(client: RobloxClient, selected: list[dict[str, Any]], config: dict[
         _sleep(sleep_for)
 
 
-def _load_wardrobe(client: RobloxClient) -> dict[str, Any]:
+def _load_wardrobe(client: RobloxClient, outfit_ids: list[int]) -> dict[str, Any]:
     """Rules plus owned wearables. The current avatar is kept even if inventory is limited."""
     rules_result = client.avatar_rules()
     if rules_result.rate_limited:
@@ -412,10 +418,19 @@ def _load_wardrobe(client: RobloxClient) -> dict[str, Any]:
             _log("inventory-rate-limit")
     if 27 not in grouped:
         raise RobloxError("Could not read the current body, so the avatar was left alone.")
+    blocked: set[int] = set()
+    for outfit_id in outfit_ids:
+        details = client.outfit_details(int(outfit_id))
+        if details.rate_limited:
+            print("Saved outfits were not all read. Random looks still skip the ones already collected.")
+            _log("outfit-scan-rate-limit")
+            break
+        if details.ok:
+            blocked.update(asset_ids_from_outfit(details.payload))
     total = sum(len(asset_ids) for asset_ids in grouped.values())
-    print(f"Randomizer loaded {total} owned items.")
-    _log(f"wardrobe items={total}")
-    return {"assets": grouped, "rules": rules}
+    print(f"Randomizer loaded {total} owned items. {len(blocked)} saved-outfit items stay off.")
+    _log(f"wardrobe items={total} blocked={len(blocked)}")
+    return {"assets": grouped, "rules": rules, "blocked": blocked}
 
 
 def _forget_assets(wardrobe: dict[str, Any], asset_ids: list[int]) -> None:

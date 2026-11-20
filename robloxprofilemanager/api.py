@@ -162,6 +162,9 @@ class RobloxClient:
             result.message = f"Roblox refused some items in this outfit ({len(invalid)} invalid)."
         return result
 
+    def outfit_details(self, outfit_id: int) -> CallResult:
+        return self._request("GET", f"https://avatar.roblox.com/v4/outfits/{outfit_id}/details")
+
     def current_avatar(self) -> CallResult:
         return self._request("GET", "https://avatar.roblox.com/v1/avatar")
 

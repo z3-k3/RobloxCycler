@@ -267,8 +267,45 @@ class FreakyAvatarTests(unittest.TestCase):
             self.assertLessEqual(sum(1 for asset_id in ids if asset_id in {70, 71, 72, 73}), 3)
             self.assertLessEqual(sum(1 for asset_id in ids if asset_id in {80, 81}), 1)
             self.assertTrue(any(asset_id in {10, 11} for asset_id in ids))
-            plain = look["fallback"]["avatarDefinition"]["updateAvatarModel"]["assets"]
-            self.assertLess(len(plain), len(ids))
+            self.assertEqual(
+                look["fallback"]["avatarDefinition"]["updateAvatarModel"]["assets"],
+                look["body"]["avatarDefinition"]["updateAvatarModel"]["assets"],
+            )
+
+    def test_saved_outfit_clothes_stay_off(self) -> None:
+        import random
+
+        rules = parse_avatar_rules(
+            {
+                "scales": {"height": {"min": 0.9, "max": 1.05, "increment": 0.01}},
+                "wearableAssetTypes": [
+                    {"id": 8, "maxNumber": 3},
+                    {"id": 11, "maxNumber": 1},
+                    {"id": 12, "maxNumber": 1},
+                ],
+                "bodyColorsPalette": [{"hexColor": "#111111"}, {"hexColor": "#00FF00"}, {"hexColor": "#FF0000"}, {"hexColor": "#0000FF"}, {"hexColor": "#FF00BF"}, {"hexColor": "#FFFF00"}],
+            }
+        )
+        grouped = {
+            17: [1],
+            27: [10],
+            28: [20],
+            29: [30],
+            30: [40],
+            31: [50],
+            18: [60],
+            8: [70, 71],
+            11: [900, 901],
+            12: [910, 911],
+        }
+        blocked = {70, 900, 910}
+        for seed in range(8):
+            look = freaky_avatar(grouped, rules, random.Random(seed), blocked)
+            ids = [item["id"] for item in look["body"]["avatarDefinition"]["updateAvatarModel"]["assets"]]
+            self.assertNotIn(70, ids)
+            self.assertNotIn(900, ids)
+            self.assertNotIn(910, ids)
+            self.assertIn(10, ids)
 
 
 if __name__ == "__main__":
