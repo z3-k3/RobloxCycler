@@ -14,6 +14,7 @@ from robloxcycler.logic import (
     merge_outfits,
     normalize_cookie,
     parse_retry_after,
+    schedule_bio_after_limit,
     select_outfits,
     slowed_interval,
     v4_wear_body,
@@ -46,6 +47,14 @@ class IntervalTests(unittest.TestCase):
         self.assertIsNone(api_block_reason(400, "Invalid assetId"))
         self.assertEqual(api_block_reason(403, "User is moderated"), "User is moderated")
         self.assertEqual(api_block_reason(403, ""), "HTTP 403")
+
+    def test_bio_limit_does_not_choose_the_outfit_gap(self) -> None:
+        wait, gap = schedule_bio_after_limit(10, 5, 0, 300)
+        self.assertEqual(gap, 20)
+        self.assertEqual(wait, 20)
+        wait, gap = schedule_bio_after_limit(20, 45, 0, 300)
+        self.assertEqual(gap, 40)
+        self.assertEqual(wait, 45)
 
     def test_slowdown_grows_and_caps(self) -> None:
         self.assertEqual(slowed_interval(60, 2, 300), 120)

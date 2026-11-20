@@ -22,6 +22,7 @@ from robloxcycler.logic import (
     normalize_cookie,
     read_config,
     save_json,
+    schedule_bio_after_limit,
     select_outfits,
     slowed_interval,
 )
@@ -102,6 +103,8 @@ def reset_slowdown(config: dict[str, Any]) -> int:
     state = _load_state()
     state["slowed"] = False
     state["cooldown_until"] = None
+    state["bio_next_at"] = None
+    state["bio_interval_seconds"] = None
     state["interval_seconds"] = active_interval(
         config["interval_seconds"],
         {"slowed": False},
@@ -224,7 +227,7 @@ def run_loop(client: RobloxClient, selected: list[dict[str, Any]], config: dict[
         state["interval_seconds"] = interval
         _save_state(state)
 
-        bio_decision = _update_bio(client, state, config, interval, outfit)
+        bio_decision = _update_bio(client, state, config, interval)
         if bio_decision == "stop":
             return 1
         if bio_decision == "wait":
@@ -243,25 +246,48 @@ def _update_bio(
     state: dict[str, Any],
     config: dict[str, Any],
     interval: float,
-    outfit: dict[str, Any],
 ) -> str:
-    """Set a new one-line bio. A 429 slows the cycle. Other bio errors do not stop it."""
+    """Set a new one-line bio when its own timer is due.
+
+    A description 429 lengthens only the bio gap. Outfit changes keep the
+    interval from config.json.
+    """
+    now = time.time()
+    due = state.get("bio_next_at")
+    if isinstance(due, (int, float)) and not isinstance(due, bool) and now < float(due):
+        return "ok"
+
     text = glitch_bio()
     try:
         result = client.set_description(text)
     except RobloxError as exc:
         if exc.transient:
-            print(f"{exc} Waiting {interval:.0f}s.")
+            print(f"{exc}")
             _log(f"bio-network-wait {exc}")
-            _sleep(interval)
-            return "wait"
+            return "ok"
         print(exc)
         _log(f"auth-stop {exc}")
         return "stop"
 
     if result.rate_limited:
-        decision = _record_rate_limit(result, state, config, interval, outfit, action="updating the bio")
-        return "stop" if decision == "stop" else "wait"
+        current = state.get("bio_interval_seconds")
+        gap_now = float(current) if isinstance(current, (int, float)) and not isinstance(current, bool) else interval
+        wait, gap = schedule_bio_after_limit(
+            gap_now,
+            result.retry_after,
+            result.wait_seconds,
+            config["max_interval_seconds"],
+        )
+        state["bio_interval_seconds"] = gap
+        state["bio_next_at"] = time.time() + wait
+        _save_state(state)
+        message = (
+            f"Rate limited while updating the bio. Next bio in {wait:.0f}s. "
+            f"Outfits stay at {interval:.0f}s."
+        )
+        print(message)
+        _log(message)
+        return "ok"
 
     if result.status == 401:
         print("The cookie expired. Paste a new .ROBLOSECURITY value into .env and start again.")
@@ -273,7 +299,11 @@ def _update_bio(
         _log(f"bio-fail status={result.status} {result.message}")
         return "ok"
 
-    print(f"Updated bio ({len(text)} chars). Next change in {interval:.0f}s.")
+    gap = state.get("bio_interval_seconds")
+    bio_gap = float(gap) if isinstance(gap, (int, float)) and not isinstance(gap, bool) else interval
+    state["bio_next_at"] = time.time() + bio_gap
+    _save_state(state)
+    print(f"Updated bio ({len(text)} chars). Next bio in {bio_gap:.0f}s.")
     _log(f"bio status={result.status} len={len(text)}")
     return "ok"
 

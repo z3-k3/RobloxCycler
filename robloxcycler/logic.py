@@ -167,6 +167,19 @@ def clamp_interval(seconds: float, maximum: float) -> float:
     return min(ceiling, max(MIN_INTERVAL_SECONDS, float(seconds)))
 
 
+def schedule_bio_after_limit(
+    current_gap: float,
+    retry_after: float | None,
+    header_wait: float,
+    maximum: float,
+) -> tuple[float, float]:
+    """Wait and the next bio gap after a description 429. The outfit gap stays put."""
+    gap = slowed_interval(max(float(current_gap), MIN_INTERVAL_SECONDS), 2, maximum)
+    pause = MIN_INTERVAL_SECONDS if retry_after is None else max(0.0, float(retry_after))
+    wait = max(pause, float(header_wait or 0), gap)
+    return wait, gap
+
+
 def slowed_interval(current: float, factor: float, maximum: float) -> float:
     """Lengthen the gap after a 429. Never shorter than the current gap."""
     grown = max(float(current) * max(float(factor), 1.0), float(current) + MIN_INTERVAL_SECONDS)
