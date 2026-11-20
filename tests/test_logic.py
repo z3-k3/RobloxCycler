@@ -1,6 +1,6 @@
 import unittest
 
-from robloxcycler.logic import (
+from robloxprofilemanager.logic import (
     MIN_INTERVAL_SECONDS,
     active_interval,
     api_block_reason,

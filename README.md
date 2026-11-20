@@ -1,6 +1,6 @@
-# RobloxCycler
+# RobloxProfileManager
 
-RobloxCycler equips outfits you already saved on your own account, one after another, so your public avatar keeps changing while the program is running.
+RobloxProfileManager changes your own Roblox profile while it is running. It cycles outfits you already saved and refreshes the About line.
 
 It signs in with your browser cookie, reads your saved Avatar outfits, and calls Roblox’s avatar API. If Roblox answers `429 Too Many Requests`, it stops hammering, waits, and makes the gap between changes longer.
 
@@ -19,7 +19,7 @@ The cookie is a full login. It can spend Robux and take items. Keep it in `.env`
 Open PowerShell in this folder.
 
 ```powershell
-cd C:\Users\laugh\Documents\RobloxCycler
+cd C:\Users\laugh\Documents\RobloxProfileManager
 python -m venv .venv
 .venv\Scripts\Activate.ps1
 pip install -r requirements.txt
@@ -86,17 +86,17 @@ The same history is appended to `logs/cycler.log`. `state.json` remembers which 
 1. Open **Task Scheduler** and create a basic task.
 2. Trigger: **When I log on**.
 3. Action: **Start a program**.
-4. Program: `C:\Users\laugh\Documents\RobloxCycler\.venv\Scripts\python.exe`
+4. Program: `C:\Users\laugh\Documents\RobloxProfileManager\.venv\Scripts\python.exe`
 5. Arguments: `main.py run`
-6. Start in: `C:\Users\laugh\Documents\RobloxCycler`
+6. Start in: `C:\Users\laugh\Documents\RobloxProfileManager`
 
 ### Run it on another computer
 
 A free cloud server is optional. The program is a normal Python process, so any machine that stays on can run `python main.py run` after you copy the repo and create `.env` there. Do not put the cookie in the Docker image or in git.
 
 ```powershell
-docker build -t robloxcycler .
-docker run --rm -it --env-file .env -v "${PWD}:/app" robloxcycler
+docker build -t robloxprofilemanager .
+docker run --rm -it --env-file .env -v "${PWD}:/app" robloxprofilemanager
 ```
 
 Oracle Cloud’s always-free VM is the usual way to keep a small Python process up when this PC is off. A laptop that sleeps will not keep cycling.
@@ -178,7 +178,7 @@ Roblox is removing a batch of older avatar routes on December 11, 2026. Equippin
 
 ```text
 main.py              commands
-robloxcycler/        Roblox calls and the timing rules
+robloxprofilemanager/   Roblox calls and the timing rules
 config.json          how fast to cycle, and what to do on a 429
 .env                 your cookie, not committed
 outfits.json         created on first run, not committed

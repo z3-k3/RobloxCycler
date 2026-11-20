@@ -8,7 +8,7 @@ from typing import Any
 
 import requests
 
-from robloxcycler.logic import header_wait_seconds, parse_retry_after, roblox_error_text, v4_wear_body
+from robloxprofilemanager.logic import header_wait_seconds, parse_retry_after, roblox_error_text, v4_wear_body
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "

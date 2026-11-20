@@ -8,8 +8,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from robloxcycler.api import RobloxClient, RobloxError
-from robloxcycler.logic import (
+from robloxprofilemanager.api import RobloxClient, RobloxError
+from robloxprofilemanager.logic import (
     MIN_INTERVAL_SECONDS,
     active_interval,
     api_block_reason,
@@ -34,7 +34,7 @@ ROOT = Path(__file__).resolve().parent.parent
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="python main.py",
-        description="Equip your saved Roblox outfits, one after another, on your public avatar.",
+        description="Manage your own Roblox profile: cycle outfits and refresh the About line.",
     )
     parser.add_argument(
         "command",
