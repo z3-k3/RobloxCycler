@@ -798,14 +798,36 @@ def glitch_bio(length: int | None = None, rng: random.Random | None = None) -> s
 
     `length` is accepted so older callers still work. The packet stays on one
     line and within 1000 characters, which is Roblox's description limit.
+    One bio in a hundred is a deformed "Roblox tried to ban me."
     """
     picker = rng or random.SystemRandom()
     del length
+    if picker.random() < 0.01:
+        return _deformed_ban_line(picker)
     for _ in range(20):
         text = _packet_bio(picker)
         if _bio_is_safe(text):
             return text
     return _safe_bio(picker)
+
+
+def _deformed_ban_line(rng: random.Random) -> str:
+    """The same sentence, with case, doubled letters, and a few lookalike digits."""
+    swaps = {"o": "0", "i": "1", "e": "3"}
+    words: list[str] = []
+    for word in ("Roblox", "tried", "to", "ban", "me"):
+        chars: list[str] = []
+        for char in word:
+            rolled = char
+            if rng.random() < 0.35 and char.lower() in swaps:
+                rolled = swaps[char.lower()]
+            elif rng.random() < 0.5:
+                rolled = char.swapcase()
+            chars.append(rolled)
+            if rng.random() < 0.2:
+                chars.append(rolled)
+        words.append("".join(chars))
+    return " ".join(words) + "."
 
 
 def _packet_bio(rng: random.Random) -> str:

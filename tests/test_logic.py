@@ -162,6 +162,26 @@ class BioTests(unittest.TestCase):
             for fragment in _BIO_BLOCKED:
                 self.assertNotIn(fragment, lowered)
 
+    def test_one_percent_of_bios_are_the_deformed_line(self) -> None:
+        import random
+
+        class _Always(random.Random):
+            def random(self) -> float:
+                return 0.0
+
+        forced = glitch_bio(rng=_Always())
+        self.assertTrue(forced.endswith("."))
+        self.assertEqual(len(forced.split(" ")), 5)
+        hits = 0
+        for seed in range(400):
+            text = glitch_bio(rng=random.Random(seed))
+            if text.endswith(".") and " " in text:
+                hits += 1
+                pieces = text[:-1].split(" ")
+                self.assertEqual(len(pieces), 5)
+        self.assertGreater(hits, 0)
+        self.assertLess(hits, 20)
+
 
 class OutfitTests(unittest.TestCase):
     def test_merge_keeps_enabled_flags_and_refreshes_names(self) -> None:
