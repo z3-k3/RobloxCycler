@@ -1,5 +1,5 @@
 {
-  "interval_seconds": 5,
+  "interval_seconds": 10,
   "max_interval_seconds": 300,
   "slowdown_factor": 2,
   "on_rate_limit": "pause",

@@ -245,7 +245,11 @@ def _record_rate_limit(
     """
     hits = int(state.get("rate_limit_hits") or 0) + 1
     fallback = min(60.0 * (2 ** min(hits, 4)), float(config["max_interval_seconds"]))
-    pause_for = result.retry_after if result.retry_after is not None else fallback
+    header_wait = float(result.wait_seconds or 0)
+    if result.retry_after is not None:
+        pause_for = max(result.retry_after, header_wait)
+    else:
+        pause_for = max(fallback, header_wait)
     new_interval = slowed_interval(interval, config["slowdown_factor"], config["max_interval_seconds"])
     state["rate_limit_hits"] = hits
     state["slowed"] = True

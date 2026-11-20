@@ -44,6 +44,8 @@ class RobloxClient:
         self.session.headers["Accept"] = "application/json"
         self.session.cookies.set(".ROBLOSECURITY", cookie, domain=".roblox.com")
         self.user_id: int | None = None
+        self._wear_route_retired = False
+        self._outfit_bodies: dict[int, dict[str, Any]] = {}
 
     def close(self) -> None:
         self.session.close()
@@ -104,62 +106,52 @@ class RobloxClient:
         return outfits
 
     def wear_outfit(self, outfit_id: int) -> CallResult:
-        details = self._request(
-            "GET",
-            f"https://avatar.roblox.com/v4/outfits/{outfit_id}/details",
-        )
-        if not details.ok or not isinstance(details.payload, dict):
-            details.ok = False
-            details.message = details.message or "Could not read that outfit."
-            return details
-        body = v4_wear_body(details.payload)
-        expected = [
-            asset["id"]
-            for asset in body["avatarDefinition"]["updateAvatarModel"].get("assets") or []
-        ]
-        if not expected:
-            return CallResult(
-                ok=False,
-                status=details.status,
-                message="That outfit has no wearable assets, so it was skipped.",
-                payload=details.payload,
+        """Wear a saved outfit with one request.
+
+        The older wear route does that by itself. Rebuilding the avatar reads
+        the outfit, patches it, reads it back, and redraws the thumbnail, which
+        spends the rate limit four times per change. That path is only used
+        after Roblox removes the wear route.
+        """
+        if not self._wear_route_retired:
+            worn = self._request(
+                "POST",
+                f"https://avatar.roblox.com/v1/outfits/{outfit_id}/wear",
             )
+            if worn.ok or worn.rate_limited or worn.status not in (404, 410):
+                return worn
+            self._wear_route_retired = True
+        return self._wear_with_saved_body(outfit_id)
+
+    def _wear_with_saved_body(self, outfit_id: int) -> CallResult:
+        body = self._outfit_bodies.get(outfit_id)
+        if body is None:
+            details = self._request(
+                "GET",
+                f"https://avatar.roblox.com/v4/outfits/{outfit_id}/details",
+            )
+            if details.rate_limited:
+                return details
+            if not details.ok or not isinstance(details.payload, dict):
+                details.ok = False
+                details.message = details.message or "Could not read that outfit."
+                return details
+            body = v4_wear_body(details.payload)
+            assets = body["avatarDefinition"]["updateAvatarModel"].get("assets") or []
+            if not assets:
+                return CallResult(
+                    ok=False,
+                    status=details.status,
+                    message="That outfit has no wearable assets, so it was skipped.",
+                    payload=details.payload,
+                )
+            self._outfit_bodies[outfit_id] = body
         result = self._request("PATCH", "https://avatar.roblox.com/v4/avatar", json_body=body)
-        if result.rate_limited or not result.ok:
-            return result
-        if isinstance(result.payload, dict) and result.payload.get("success") is False:
+        if result.ok and isinstance(result.payload, dict) and result.payload.get("success") is False:
             invalid = result.payload.get("invalidAssets") or []
             result.ok = False
             result.message = f"Roblox refused some items in this outfit ({len(invalid)} invalid)."
-            return result
-        worn = self._worn_asset_ids()
-        if worn is not None and set(worn) != set(expected):
-            result.ok = False
-            result.message = "Roblox accepted the update, but the worn avatar did not change."
-            return result
-        redraw = self._request("POST", "https://avatar.roblox.com/v1/avatar/redraw-thumbnail")
-        if redraw.rate_limited or redraw.status == 403:
-            return redraw
         return result
-
-    def _worn_asset_ids(self) -> list[int] | None:
-        if self.user_id is None:
-            self.whoami()
-        result = self._request(
-            "GET",
-            f"https://avatar.roblox.com/v4/avatar/users/{self.user_id}",
-            params={"selectionTypes": "AvatarModel"},
-        )
-        if not result.ok or not isinstance(result.payload, dict):
-            return None
-        model = result.payload.get("avatarModel")
-        if not isinstance(model, dict) or not isinstance(model.get("assets"), list):
-            return None
-        return [
-            asset["id"]
-            for asset in model["assets"]
-            if isinstance(asset, dict) and isinstance(asset.get("id"), int)
-        ]
 
     def _request(
         self,

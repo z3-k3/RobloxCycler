@@ -4,7 +4,7 @@ RobloxCycler equips outfits you already saved on your own account, one after ano
 
 It signs in with your browser cookie, reads your saved Avatar outfits, and calls Roblox’s avatar API. If Roblox answers `429 Too Many Requests`, it stops hammering, waits, and makes the gap between changes longer.
 
-The configured gap is **5 seconds**. That is also the fastest it will go. If Roblox answers `429`, the gap doubles so the account is less likely to get restricted. If Roblox blocks the account from the API, the program stops.
+The configured gap is **10 seconds**, and each change is one wear request. Five seconds is the fastest the program will attempt. That pace sends about 12 requests a minute, which is over the roughly 10 a minute these outfit routes have been reported to allow. If Roblox answers `429`, the gap doubles so the account is less likely to get restricted. If Roblox blocks the account from the API, the program stops.
 
 ## What you need
 
@@ -121,8 +121,9 @@ If the cookie starts returning `401`, it expired. Copy a new one into `.env`. Lo
 
 | Interval | What to expect |
 | --- | --- |
-| 5 seconds | Current setting, and the fastest this program allows. About 12 equips a minute. |
-| After a 429 | The gap doubles: 5s, then 10s, then 20s, up to 300s. |
+| 10 seconds | Current setting. About 6 equips a minute, under the reported limit. |
+| 5 seconds | Fastest this program allows. About 12 equips a minute, which is easy to get limited at. |
+| After a 429 | The gap doubles: 10s, then 20s, then 40s, up to 300s. |
 | Under 5 seconds | Raised back to 5 seconds. |
 
 Developers have reported roughly 10 requests a minute on related outfit routes. Roblox also says extra, unpublished limits can apply, and the response headers are what you should obey. This tool reads `Retry-After` and the `x-ratelimit-*` headers and backs off. It does not try to get around a limit.
@@ -131,7 +132,7 @@ Change the pace in `config.json`:
 
 ```json
 {
-  "interval_seconds": 5
+  "interval_seconds": 10
 }
 ```
 
@@ -141,9 +142,9 @@ Change the pace in `config.json`:
 
 | Field | Meaning |
 | --- | --- |
-| `interval_seconds` | Seconds between successful equips. This project uses 5. Values under 5 are raised to 5. |
+| `interval_seconds` | Seconds between successful equips. This project uses 10. Values under 5 are raised to 5. |
 | `max_interval_seconds` | Ceiling after automatic slowdowns. Default 300. |
-| `slowdown_factor` | How much the gap grows after a 429. Default 2, so 5 becomes 10. |
+| `slowdown_factor` | How much the gap grows after a 429. Default 2, so 10 becomes 20. |
 | `on_rate_limit` | `pause` waits, lengthens the gap, and keeps going. `stop` exits on a 429 instead. An API block exits either way. |
 | `request_timeout_seconds` | How long one Roblox request may hang. |
 | `outfit_ids` | Leave `[]` to use every enabled outfit in `outfits.json`. Or list ids, in cycle order: `[111, 222]`. |
