@@ -1,0 +1,8 @@
+{
+  "interval_seconds": 5,
+  "max_interval_seconds": 300,
+  "slowdown_factor": 2,
+  "on_rate_limit": "pause",
+  "request_timeout_seconds": 30,
+  "outfit_ids": [5736420556980892, 4787524947019637]
+}

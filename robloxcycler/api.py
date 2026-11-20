@@ -1,0 +1,249 @@
+"""Authenticated calls to the Roblox avatar endpoints for the signed-in user."""
+
+from __future__ import annotations
+
+import time
+from dataclasses import dataclass, field
+from typing import Any
+
+import requests
+
+from robloxcycler.logic import header_wait_seconds, parse_retry_after, roblox_error_text, v4_wear_body
+
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/131.0.0.0 Safari/537.36"
+)
+
+
+class RobloxError(RuntimeError):
+    def __init__(self, message: str, status: int | None = None, transient: bool = False):
+        super().__init__(message)
+        self.status = status
+        self.transient = transient
+
+
+@dataclass
+class CallResult:
+    ok: bool
+    status: int
+    message: str
+    rate_limited: bool = False
+    retry_after: float | None = None
+    wait_seconds: float = 0.0
+    payload: Any = None
+    headers: dict[str, str] = field(default_factory=dict)
+
+
+class RobloxClient:
+    def __init__(self, cookie: str, timeout: float):
+        self.timeout = timeout
+        self.session = requests.Session()
+        self.session.headers["User-Agent"] = USER_AGENT
+        self.session.headers["Accept"] = "application/json"
+        self.session.cookies.set(".ROBLOSECURITY", cookie, domain=".roblox.com")
+        self.user_id: int | None = None
+
+    def close(self) -> None:
+        self.session.close()
+
+    def whoami(self) -> dict[str, Any]:
+        try:
+            response = self.session.get(
+                "https://users.roblox.com/v1/users/authenticated",
+                timeout=self.timeout,
+            )
+        except requests.RequestException as exc:
+            raise RobloxError(
+                "Could not reach Roblox. Check the connection and try again.",
+                transient=True,
+            ) from exc
+        if response.status_code != 200:
+            raise RobloxError(
+                "Roblox rejected the cookie. Copy a fresh .ROBLOSECURITY value into .env.",
+                response.status_code,
+            )
+        payload = _json_or_empty(response)
+        if not isinstance(payload, dict) or not payload.get("id") or not payload.get("name"):
+            raise RobloxError("Roblox did not return the signed-in user.")
+        self.user_id = int(payload["id"])
+        return payload
+
+    def list_outfits(self, user_id: int) -> list[dict[str, Any]]:
+        outfits: list[dict[str, Any]] = []
+        page = 1
+        token = ""
+        while page <= 20:
+            params: dict[str, Any] = {"itemsPerPage": 50, "page": page}
+            if token:
+                params["paginationToken"] = token
+            result = self._request(
+                "GET",
+                f"https://avatar.roblox.com/v2/avatar/users/{user_id}/outfits",
+                params=params,
+            )
+            if result.rate_limited:
+                raise RobloxError(
+                    "Roblox rate limited the outfit list. Wait a few minutes, then run this again.",
+                    429,
+                )
+            if not result.ok or not isinstance(result.payload, dict):
+                raise RobloxError(
+                    f"Could not list outfits ({result.status}): {result.message}",
+                    result.status,
+                )
+            batch = result.payload.get("data") or []
+            if not isinstance(batch, list) or not batch:
+                break
+            outfits.extend(item for item in batch if isinstance(item, dict))
+            token = str(result.payload.get("paginationToken") or "")
+            if len(batch) < 50:
+                break
+            page += 1
+        return outfits
+
+    def wear_outfit(self, outfit_id: int) -> CallResult:
+        details = self._request(
+            "GET",
+            f"https://avatar.roblox.com/v4/outfits/{outfit_id}/details",
+        )
+        if not details.ok or not isinstance(details.payload, dict):
+            details.ok = False
+            details.message = details.message or "Could not read that outfit."
+            return details
+        body = v4_wear_body(details.payload)
+        expected = [
+            asset["id"]
+            for asset in body["avatarDefinition"]["updateAvatarModel"].get("assets") or []
+        ]
+        if not expected:
+            return CallResult(
+                ok=False,
+                status=details.status,
+                message="That outfit has no wearable assets, so it was skipped.",
+                payload=details.payload,
+            )
+        result = self._request("PATCH", "https://avatar.roblox.com/v4/avatar", json_body=body)
+        if result.rate_limited or not result.ok:
+            return result
+        if isinstance(result.payload, dict) and result.payload.get("success") is False:
+            invalid = result.payload.get("invalidAssets") or []
+            result.ok = False
+            result.message = f"Roblox refused some items in this outfit ({len(invalid)} invalid)."
+            return result
+        worn = self._worn_asset_ids()
+        if worn is not None and set(worn) != set(expected):
+            result.ok = False
+            result.message = "Roblox accepted the update, but the worn avatar did not change."
+            return result
+        redraw = self._request("POST", "https://avatar.roblox.com/v1/avatar/redraw-thumbnail")
+        if redraw.rate_limited or redraw.status == 403:
+            return redraw
+        return result
+
+    def _worn_asset_ids(self) -> list[int] | None:
+        if self.user_id is None:
+            self.whoami()
+        result = self._request(
+            "GET",
+            f"https://avatar.roblox.com/v4/avatar/users/{self.user_id}",
+            params={"selectionTypes": "AvatarModel"},
+        )
+        if not result.ok or not isinstance(result.payload, dict):
+            return None
+        model = result.payload.get("avatarModel")
+        if not isinstance(model, dict) or not isinstance(model.get("assets"), list):
+            return None
+        return [
+            asset["id"]
+            for asset in model["assets"]
+            if isinstance(asset, dict) and isinstance(asset.get("id"), int)
+        ]
+
+    def _request(
+        self,
+        method: str,
+        url: str,
+        *,
+        params: dict[str, Any] | None = None,
+        json_body: Any = None,
+        retry_csrf: bool = True,
+    ) -> CallResult:
+        try:
+            response = self.session.request(
+                method,
+                url,
+                params=params,
+                json=json_body,
+                timeout=self.timeout,
+            )
+        except requests.RequestException as exc:
+            raise RobloxError(
+                "Could not reach Roblox. Check the connection and try again.",
+                transient=True,
+            ) from exc
+        if response.status_code == 403 and retry_csrf and _needs_csrf(response):
+            self._refresh_csrf(response)
+            return self._request(
+                method,
+                url,
+                params=params,
+                json_body=json_body,
+                retry_csrf=False,
+            )
+        return _to_result(response)
+
+    def _refresh_csrf(self, previous: requests.Response) -> None:
+        token = previous.headers.get("x-csrf-token")
+        if not token:
+            try:
+                probe = self.session.post("https://auth.roblox.com/v2/logout", timeout=self.timeout)
+            except requests.RequestException as exc:
+                raise RobloxError(
+                    "Could not reach Roblox. Check the connection and try again.",
+                    transient=True,
+                ) from exc
+            token = probe.headers.get("x-csrf-token")
+        if not token:
+            raise RobloxError(
+                "Roblox did not issue an X-CSRF-TOKEN. The cookie is probably expired.",
+                403,
+            )
+        self.session.headers["x-csrf-token"] = token
+
+
+def _needs_csrf(response: requests.Response) -> bool:
+    if response.headers.get("x-csrf-token"):
+        return True
+    text = response.text.lower()
+    return "token validation" in text or "x-csrf-token" in text
+
+
+def _json_or_empty(response: requests.Response) -> Any:
+    if not response.text.strip():
+        return None
+    try:
+        return response.json()
+    except ValueError:
+        return None
+
+
+def _to_result(response: requests.Response) -> CallResult:
+    now = time.time()
+    payload = _json_or_empty(response)
+    message = roblox_error_text(payload, response.text)
+    rate_limited = response.status_code == 429
+    retry_after = parse_retry_after(response.headers.get("Retry-After"), now) if rate_limited else None
+    wait_seconds = header_wait_seconds(response.headers, now)
+    headers = {key.lower(): value for key, value in response.headers.items()}
+    return CallResult(
+        ok=200 <= response.status_code < 300,
+        status=response.status_code,
+        message=message,
+        rate_limited=rate_limited,
+        retry_after=retry_after,
+        wait_seconds=wait_seconds,
+        payload=payload,
+        headers=headers,
+    )
