@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import random
-import string
 from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any
@@ -433,9 +432,10 @@ _BIO_BLOCKED = (
 
 
 def glitch_bio(length: int | None = None, rng: random.Random | None = None) -> str:
-    """One line of fresh terminal noise, 500 to 1000 characters, with OPSEC near the start.
+    """One line of terminal noise, 500 to 1000 characters, with OPSEC near the start.
 
-    Letters, digits, and underscores only. Chunks that spell a filtered fragment are dropped.
+    Every word is taken from a fixed list. Digits and underscores fill the rest.
+    No random letters, so a chunk cannot spell a word the list does not contain.
     """
     picker = rng or random.SystemRandom()
     target = picker.randint(500, 1000) if length is None else length
@@ -455,11 +455,21 @@ def _assemble_bio(rng: random.Random, target: int) -> str:
         chunks.append(chunk)
         built += len(chunk)
     text = "".join(chunks)
-    spot = rng.randint(0, 80)
-    text = text[:spot] + "OPSEC" + text[spot:]
-    if len(text) < target:
+    breaks = [index for index, char in enumerate(text) if char == "_" and index <= 80]
+    if breaks:
+        spot = rng.choice(breaks) + 1
+        text = text[:spot] + "OPSEC_" + text[spot:]
+    else:
+        text = "OPSEC_" + text
+    while len(text) < target:
         text += _safe_chunk(rng)
-    return text[:target]
+    if len(text) > target:
+        cut = text.rfind("_", 0, target + 1)
+        if cut >= 500:
+            text = text[:cut]
+    if len(text) > 1000:
+        text = text[: text.rfind("_", 0, 1001)]
+    return text
 
 
 def _safe_chunk(rng: random.Random) -> str:
@@ -479,22 +489,15 @@ def _bio_is_plain(text: str) -> bool:
 
 def _glitch_chunk(rng: random.Random) -> str:
     kind = rng.randrange(4)
+    number = f"{rng.randint(0, 9999):03d}"
     if kind == 0:
-        left = _noise_token(rng, 3, 8)
-        right = _noise_token(rng, 3, 8)
-        wrap = rng.choice(("xX_", "_Xx"))
-        return f"{wrap}{left}_{right}"
+        wrap = rng.choice(("xX", "Xx"))
+        return f"{wrap}_{_cased_stem(rng)}_{number}_"
     if kind == 1:
-        return f"{_cased_stem(rng)}_{_cased_stem(rng)}_{rng.randint(0, 9999):03d}"
+        return f"{_cased_stem(rng)}_{_cased_stem(rng)}_{number}_"
     if kind == 2:
-        return "NULL_" * rng.randint(2, 4) + f"{rng.randint(0, 99):02d}"
-    return _cased_stem(rng) + "_" + _noise_token(rng, 2, 6)
-
-
-def _noise_token(rng: random.Random, shortest: int, longest: int) -> str:
-    alphabet = string.ascii_letters + string.digits + "_"
-    count = rng.randint(shortest, longest)
-    return "".join(rng.choice(alphabet) for _ in range(count))
+        return "NULL_" * rng.randint(2, 4) + f"{number}_"
+    return f"{_cased_stem(rng)}_{number}_"
 
 
 def _cased_stem(rng: random.Random) -> str:

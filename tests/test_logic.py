@@ -8,6 +8,7 @@ from robloxcycler.logic import (
     body_colors_payload,
     clamp_interval,
     cookie_from_text,
+    _BIO_STEMS,
     glitch_bio,
     header_wait_seconds,
     is_avatar_outfit,
@@ -100,9 +101,19 @@ class BioTests(unittest.TestCase):
             self.assertTrue(any(char.isdigit() for char in text))
             self.assertIn("_", text)
             self.assertTrue(all(char.isalnum() or char == "_" for char in text))
-            lowered = text.lower()
-            for fragment in ("hack", "cheat", "discord", "robux", "#", "*", "/"):
-                self.assertNotIn(fragment, lowered)
+            allowed = {stem.lower() for stem in _BIO_STEMS} | {"opsec", "xx"}
+            words = []
+            current = []
+            for char in text:
+                if char.isalpha():
+                    current.append(char)
+                elif current:
+                    words.append("".join(current).lower())
+                    current = []
+            if current:
+                words.append("".join(current).lower())
+            self.assertTrue(words)
+            self.assertTrue(all(word in allowed for word in words))
 
 
 class OutfitTests(unittest.TestCase):
