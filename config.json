@@ -4,5 +4,6 @@
   "slowdown_factor": 2,
   "on_rate_limit": "pause",
   "request_timeout_seconds": 30,
+  "avatar_mode": "random",
   "outfit_ids": [6560905358157457, 5502791244024100, 5805561560103471, 6591116057840594, 5342657007415268, 4787524947019637]
 }

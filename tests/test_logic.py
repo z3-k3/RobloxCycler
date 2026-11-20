@@ -7,18 +7,23 @@ from robloxprofilemanager.logic import (
     avatar_type_value,
     body_colors_payload,
     clamp_interval,
+    _BIO_BLOCKED,
+    adapt_bio_pace,
+    badge_pause_seconds,
     cookie_from_text,
-    _BIO_STEMS,
     glitch_bio,
     header_wait_seconds,
     is_avatar_outfit,
     merge_outfits,
     normalize_cookie,
+    parse_badge_id,
     parse_retry_after,
-    relax_bio_gap,
+    prepared_bio_gap,
     schedule_bio_after_limit,
     select_outfits,
     slowed_interval,
+    freaky_avatar,
+    parse_avatar_rules,
     v4_wear_body,
 )
 
@@ -50,17 +55,62 @@ class IntervalTests(unittest.TestCase):
         self.assertEqual(api_block_reason(403, "User is moderated"), "User is moderated")
         self.assertEqual(api_block_reason(403, ""), "HTTP 403")
 
-    def test_successful_bio_returns_to_the_outfit_gap(self) -> None:
-        self.assertEqual(relax_bio_gap(80, 10), 10)
-        self.assertEqual(relax_bio_gap(10, 10), 10)
+    def test_successful_bio_holds_the_slow_floor(self) -> None:
+        pace = adapt_bio_pace(10, accepted=True, maximum=300)
+        self.assertEqual(pace.gap_seconds, 60)
+        self.assertEqual(pace.wait_seconds, 60)
+        self.assertIsNone(pace.blocked_seconds)
+
+    def test_a_refusal_stays_slower_than_the_retry_window(self) -> None:
+        pace = adapt_bio_pace(10, accepted=False, maximum=300, retry_after=44)
+        self.assertGreaterEqual(pace.gap_seconds, 69)
+        self.assertEqual(pace.wait_seconds, pace.gap_seconds)
+        self.assertEqual(pace.blocked_seconds, pace.gap_seconds)
+        held = adapt_bio_pace(
+            pace.gap_seconds,
+            accepted=True,
+            maximum=300,
+            blocked_seconds=pace.blocked_seconds,
+        )
+        self.assertEqual(held.gap_seconds, pace.gap_seconds)
+
+    def test_a_long_retry_after_pushes_the_bio_further_out(self) -> None:
+        pace = adapt_bio_pace(60, accepted=False, maximum=300, retry_after=90)
+        self.assertGreaterEqual(pace.gap_seconds, 103.5)
+        self.assertEqual(pace.wait_seconds, pace.gap_seconds)
+
+    def test_startup_does_not_return_the_bio_to_the_outfit_gap(self) -> None:
+        self.assertEqual(prepared_bio_gap(10, None, 300), (60, None))
+        self.assertEqual(prepared_bio_gap(None, None, 300), (60, None))
+        self.assertEqual(prepared_bio_gap(80, 10, 300), (80, 60))
 
     def test_bio_limit_does_not_choose_the_outfit_gap(self) -> None:
-        wait, gap = schedule_bio_after_limit(10, 5, 0, 300)
-        self.assertEqual(gap, 20)
-        self.assertEqual(wait, 20)
-        wait, gap = schedule_bio_after_limit(20, 45, 0, 300)
-        self.assertEqual(gap, 40)
-        self.assertEqual(wait, 45)
+        wait, gap = schedule_bio_after_limit(10, 44, 0, 300)
+        self.assertGreaterEqual(gap, 69)
+        self.assertEqual(wait, gap)
+        wait, gap = schedule_bio_after_limit(60, 90, 0, 300)
+        self.assertGreaterEqual(gap, 103.5)
+        self.assertEqual(wait, gap)
+
+    def test_a_later_bio_limit_moves_the_safe_pace_out(self) -> None:
+        pace = adapt_bio_pace(60, accepted=False, maximum=300, blocked_seconds=60, retry_after=44)
+        self.assertGreaterEqual(pace.gap_seconds, 69)
+        self.assertEqual(pace.blocked_seconds, pace.gap_seconds)
+
+    def test_a_success_does_not_speed_back_through_the_hold(self) -> None:
+        pace = adapt_bio_pace(60, accepted=True, maximum=300, blocked_seconds=69)
+        self.assertGreaterEqual(pace.gap_seconds, 69)
+        self.assertEqual(pace.blocked_seconds, 69)
+
+    def test_badge_checks_back_off_once_the_list_is_empty(self) -> None:
+        self.assertEqual(badge_pause_seconds(4, limited=False), 20)
+        self.assertEqual(badge_pause_seconds(0, limited=False), 7200)
+        self.assertEqual(badge_pause_seconds(3, limited=True, retry_after=44), 60)
+        self.assertEqual(badge_pause_seconds(3, limited=True, retry_after=90), 90)
+        self.assertEqual(parse_badge_id(12), 12)
+        self.assertEqual(parse_badge_id("88"), 88)
+        self.assertIsNone(parse_badge_id(True))
+        self.assertIsNone(parse_badge_id(0))
 
     def test_slowdown_grows_and_caps(self) -> None:
         self.assertEqual(slowed_interval(60, 2, 300), 120)
@@ -91,34 +141,26 @@ class RetryAfterTests(unittest.TestCase):
 
 
 class BioTests(unittest.TestCase):
-    def test_each_bio_is_a_fresh_one_line_block(self) -> None:
+    def test_each_bio_is_a_fresh_packet_line(self) -> None:
         import random
 
-        first = glitch_bio(rng=random.Random(1))
-        second = glitch_bio(rng=random.Random(2))
-        self.assertNotEqual(first, second)
-        for text in (first, second):
-            self.assertGreaterEqual(len(text), 500)
+        samples = [glitch_bio(rng=random.Random(seed)) for seed in range(1, 13)]
+        self.assertEqual(len(set(samples)), len(samples))
+        self.assertGreaterEqual(len({text.split("::", 1)[0] for text in samples}), 3)
+        for text in samples:
             self.assertLessEqual(len(text), 1000)
+            self.assertGreater(len(text), 180)
+            self.assertTrue(text.startswith(("RBX_NET::", "RBX_FRAME::", "NET_TRACE::", "FRAME_LINK::", "RBX_LINK::", "TRACE_NET::")))
+            self.assertTrue(text.endswith("::END"))
+            self.assertIn("::SESSION[0x", text)
+            self.assertIn("::CHANNEL[", text)
             self.assertNotIn("\n", text)
             self.assertNotIn("\r", text)
-            self.assertIn("OPSEC", text[:90])
-            self.assertTrue(any(char.isdigit() for char in text))
-            self.assertIn("_", text)
-            self.assertTrue(all(char.isalnum() or char == "_" for char in text))
-            allowed = {stem.lower() for stem in _BIO_STEMS} | {"opsec", "xx"}
-            words = []
-            current = []
-            for char in text:
-                if char.isalpha():
-                    current.append(char)
-                elif current:
-                    words.append("".join(current).lower())
-                    current = []
-            if current:
-                words.append("".join(current).lower())
-            self.assertTrue(words)
-            self.assertTrue(all(word in allowed for word in words))
+            self.assertNotIn(" ", text)
+            self.assertTrue(all(char.isalnum() or char in "_:[]" for char in text))
+            lowered = text.lower()
+            for fragment in _BIO_BLOCKED:
+                self.assertNotIn(fragment, lowered)
 
 
 class OutfitTests(unittest.TestCase):
@@ -167,6 +209,66 @@ class OutfitTests(unittest.TestCase):
         self.assertEqual(model["assets"], [{"id": 99, "meta": {"order": 1}}])
         self.assertEqual(avatar_type_value("R6"), 1)
         self.assertEqual(body_colors_payload({"headColor": "#abc"}), {"headColor": "#abc"})
+
+
+class FreakyAvatarTests(unittest.TestCase):
+    def test_scales_hit_the_caps_and_slots_do_not_overflow(self) -> None:
+        import random
+
+        rules = parse_avatar_rules(
+            {
+                "scales": {
+                    "height": {"min": 0.9, "max": 1.05, "increment": 0.01},
+                    "width": {"min": 0.7, "max": 1.0, "increment": 0.01},
+                    "head": {"min": 0.95, "max": 1.0, "increment": 0.01},
+                    "proportion": {"min": 0.0, "max": 1.0, "increment": 0.01},
+                    "bodyType": {"min": 0.0, "max": 1.0, "increment": 0.01},
+                },
+                "wearableAssetTypes": [
+                    {"id": 8, "maxNumber": 3, "name": "Hat"},
+                    {"id": 27, "maxNumber": 1, "name": "Torso"},
+                    {"id": 41, "maxNumber": 1, "name": "Hair Accessory"},
+                ],
+                "bodyColorsPalette": [
+                    {"hexColor": "#111111"},
+                    {"hexColor": "#F8F8F8"},
+                    {"hexColor": "#00FF00"},
+                    {"hexColor": "#FF0000"},
+                    {"hexColor": "#0000FF"},
+                    {"hexColor": "#FF00BF"},
+                ],
+            }
+        )
+        grouped = {
+            17: [1],
+            27: [10, 11],
+            28: [20],
+            29: [30],
+            30: [40],
+            31: [50],
+            18: [60],
+            8: [70, 71, 72, 73],
+            41: [80, 81],
+        }
+        first = freaky_avatar(grouped, rules, random.Random(1))
+        second = freaky_avatar(grouped, rules, random.Random(2))
+        self.assertNotEqual(first["body"], second["body"])
+        for look in (first, second):
+            scales = look["body"]["avatarDefinition"]["updateAvatarModel"]["scales"]
+            self.assertIn(scales["height"], (0.9, 1.05))
+            self.assertIn(scales["width"], (0.7, 1.0))
+            self.assertIn(scales["proportion"], (0.0, 1.0))
+            self.assertIn(scales["bodyType"], (0.0, 1.0))
+            colors = list(look["colors"].values())
+            self.assertEqual(len(colors), 6)
+            self.assertEqual(len(set(colors)), 6)
+            ids = [item["id"] for item in look["body"]["avatarDefinition"]["updateAvatarModel"]["assets"]]
+            self.assertEqual(len(ids), len(set(ids)))
+            self.assertLessEqual(sum(1 for asset_id in ids if asset_id in {70, 71, 72, 73}), 3)
+            self.assertLessEqual(sum(1 for asset_id in ids if asset_id in {80, 81}), 1)
+            self.assertTrue(any(asset_id in {10, 11} for asset_id in ids))
+            plain = look["fallback"]["avatarDefinition"]["updateAvatarModel"]["assets"]
+            self.assertLess(len(plain), len(ids))
 
 
 if __name__ == "__main__":

@@ -3,27 +3,41 @@
 from __future__ import annotations
 
 import argparse
+import os
+import random
+import threading
 import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+import requests
+
 from robloxprofilemanager.api import RobloxClient, RobloxError
 from robloxprofilemanager.logic import (
+    BADGE_DELETE_SECONDS,
+    BADGE_IDLE_SECONDS,
+    BIO_START_SECONDS,
     MIN_INTERVAL_SECONDS,
     active_interval,
+    adapt_bio_pace,
     api_block_reason,
-    is_avatar_outfit,
+    badge_pause_seconds,
+    absorb_wearables,
+    add_owned_asset,
     cookie_from_text,
+    freaky_avatar,
     glitch_bio,
+    is_avatar_outfit,
+    parse_avatar_rules,
     load_dotenv,
     load_json,
     merge_outfits,
     normalize_cookie,
+    optional_seconds,
+    prepared_bio_gap,
     read_config,
-    relax_bio_gap,
     save_json,
-    schedule_bio_after_limit,
     select_outfits,
     slowed_interval,
 )
@@ -82,7 +96,7 @@ def main(argv: list[str] | None = None) -> int:
             _print_outfits(outfits["merged"], outfits["selected"])
             return 0
         selected = outfits["selected"]
-        if len(selected) < 2:
+        if config["avatar_mode"] != "random" and len(selected) < 2:
             print("You need at least two saved Avatar outfits to cycle.")
             print("On roblox.com, open Avatar, dress the character, and save an outfit. Do that twice.")
             print("Then run: python main.py outfits")
@@ -106,13 +120,18 @@ def reset_slowdown(config: dict[str, Any]) -> int:
     state["cooldown_until"] = None
     state["bio_next_at"] = None
     state["bio_interval_seconds"] = None
+    state["bio_blocked_seconds"] = None
+    state["badge_next_at"] = None
     state["interval_seconds"] = active_interval(
         config["interval_seconds"],
         {"slowed": False},
         config["max_interval_seconds"],
     )
     _save_state(state)
-    print(f"Cleared the rate-limit slowdown. Next run uses {state['interval_seconds']:.0f}s from config.json.")
+    print(
+        f"Cleared the rate-limit slowdown. Outfits use {state['interval_seconds']:.0f}s from config.json. "
+        f"The bio waits {BIO_START_SECONDS:.0f}s."
+    )
     return 0
 
 
@@ -162,15 +181,44 @@ def run_loop(client: RobloxClient, selected: list[dict[str, Any]], config: dict[
             f"Using {interval:.0f}s between outfits because an earlier run was rate limited. "
             "python main.py reset goes back to config.json."
         )
-    saved_bio = state.get("bio_interval_seconds")
-    if isinstance(saved_bio, (int, float)) and not isinstance(saved_bio, bool) and float(saved_bio) > interval:
-        print(f"Bio gap was {float(saved_bio):.0f}s. Trying {interval:.0f}s again.")
-        state["bio_interval_seconds"] = interval
-        state["bio_next_at"] = None
-        _save_state(state)
-    print(f"Cycling {len(selected)} outfits every {interval:.0f}s. Ctrl+C stops it.")
-    print("A 429 makes the gap longer. A block on the account stops the program.")
-    _log(f"start count={len(selected)} interval={interval:.0f}s")
+    saved_bio = optional_seconds(state.get("bio_interval_seconds"))
+    gap, blocked = prepared_bio_gap(
+        saved_bio,
+        optional_seconds(state.get("bio_blocked_seconds")),
+        config["max_interval_seconds"],
+    )
+    state["bio_interval_seconds"] = gap
+    state["bio_blocked_seconds"] = blocked
+    due = optional_seconds(state.get("bio_next_at"))
+    earliest = time.time() + gap
+    if due is None or due < earliest:
+        state["bio_next_at"] = earliest
+    _save_state(state)
+    print(f"Bio changes every {gap:.0f}s, slower than the outfit cycle, so description updates stay under the limit.")
+    random_mode = config["avatar_mode"] == "random"
+    wardrobe: dict[str, Any] | None = None
+    if random_mode:
+        print(f"Random avatar test. A new look every {interval:.0f}s. Ctrl+C stops it.")
+        print('Set "avatar_mode" to "cycle" in config.json to go back to the saved outfits.')
+        _log(f"start mode=random interval={interval:.0f}s")
+        _notify(
+            "Manager started",
+            [f"Random avatar every {interval:.0f}s. Outfit cycle is paused."],
+            color=0x5865F2,
+        )
+    else:
+        print(f"Cycling {len(selected)} outfits every {interval:.0f}s. Ctrl+C stops it.")
+        _log(f"start count={len(selected)} interval={interval:.0f}s")
+        _notify(
+            "Manager started",
+            [f"Cycling {len(selected)} outfits every {interval:.0f}s."],
+            color=0x5865F2,
+        )
+    if config["remove_badges"]:
+        print(
+            f"Owned badges are removed one every {BADGE_DELETE_SECONDS:.0f}s. "
+            f"With none left, the list is checked every {BADGE_IDLE_SECONDS / 3600:.0f}h."
+        )
 
     failures = 0
     while True:
@@ -180,19 +228,48 @@ def run_loop(client: RobloxClient, selected: list[dict[str, Any]], config: dict[
             state,
             config["max_interval_seconds"],
         )
-        index = int(state.get("next_index") or 0) % len(selected)
-        outfit = selected[index]
-        try:
-            result = client.wear_outfit(int(outfit["id"]))
-        except RobloxError as exc:
-            if exc.transient:
-                print(f"{exc} Waiting {interval:.0f}s.")
-                _log(f"network-wait {exc}")
-                _sleep(interval)
-                continue
-            print(exc)
-            _log(f"auth-stop {exc}")
-            return 1
+        if random_mode:
+            if wardrobe is None:
+                try:
+                    wardrobe = _load_wardrobe(client)
+                except RobloxError as exc:
+                    if exc.transient:
+                        print(f"{exc} Waiting {interval:.0f}s.")
+                        _log(f"network-wait {exc}")
+                        _sleep(interval)
+                        continue
+                    print(exc)
+                    _log(f"auth-stop {exc}")
+                    return 1
+            look = freaky_avatar(wardrobe["assets"], wardrobe["rules"], random.SystemRandom())
+            outfit = {"id": 0, "name": _look_label(look)}
+            try:
+                result = client.wear_body(look["body"], look["fallback"])
+                _forget_assets(wardrobe, result.removed_ids)
+            except RobloxError as exc:
+                if exc.transient:
+                    print(f"{exc} Waiting {interval:.0f}s.")
+                    _log(f"network-wait {exc}")
+                    _sleep(interval)
+                    continue
+                print(exc)
+                _log(f"auth-stop {exc}")
+                return 1
+            index = 0
+        else:
+            index = int(state.get("next_index") or 0) % len(selected)
+            outfit = selected[index]
+            try:
+                result = client.wear_outfit(int(outfit["id"]))
+            except RobloxError as exc:
+                if exc.transient:
+                    print(f"{exc} Waiting {interval:.0f}s.")
+                    _log(f"network-wait {exc}")
+                    _sleep(interval)
+                    continue
+                print(exc)
+                _log(f"auth-stop {exc}")
+                return 1
 
         if result.rate_limited:
             decision = _record_rate_limit(result, state, config, interval, outfit)
@@ -206,6 +283,11 @@ def run_loop(client: RobloxClient, selected: list[dict[str, Any]], config: dict[
             print(f"Roblox blocked API access ({result.status}): {blocked}")
             print("Stopped. Wait until that block lifts before running this again.")
             _log(f"api-block status={result.status} {blocked}")
+            _notify(
+                "API blocked",
+                [f"Status: {result.status}", blocked, "The manager stopped."],
+                color=0xED4245,
+            )
             state["last_status"] = result.status
             _save_state(state)
             return 1
@@ -213,24 +295,58 @@ def run_loop(client: RobloxClient, selected: list[dict[str, Any]], config: dict[
         if result.status == 401:
             print("The cookie expired. Paste a new .ROBLOSECURITY value into .env and start again.")
             _log("cookie expired")
+            _notify("Cookie expired", ["Paste a new .ROBLOSECURITY value into .env."], color=0xED4245)
             return 1
 
         if not result.ok:
             failures += 1
             print(f"Skipped \"{outfit['name']}\" ({outfit['id']}): {result.status} {result.message}")
             _log(f"fail id={outfit['id']} status={result.status} {result.message}")
-            if failures >= len(selected):
-                print("Every outfit in the cycle failed. Stopped so this does not keep requesting.")
+            _notify(
+                "Outfit skipped",
+                [
+                    f"Outfit: {outfit['name']}",
+                    f"ID: {outfit['id']}",
+                    f"Status: {result.status}",
+                    str(result.message)[:300],
+                ],
+                color=0xED4245,
+            )
+            limit = max(len(selected), 1) if not random_mode else 5
+            if failures >= limit:
+                print("The avatar update failed too many times. Stopped so this does not keep requesting.")
+                _notify("Manager stopped", ["The avatar update failed too many times."], color=0xED4245)
                 return 1
         else:
             failures = 0
-            print(f"Equipped \"{outfit['name']}\" ({outfit['id']}). Next change in {interval:.0f}s.")
-            _log(f"equipped id={outfit['id']} name={outfit['name']} status={result.status}")
+            if random_mode:
+                print(f"Applied a random avatar. Next change in {interval:.0f}s.")
+                _log(f"random-avatar status={result.status} {outfit['name']}")
+                _notify(
+                    "Random avatar",
+                    [outfit["name"], f"Status: {result.status}", f"Next change: {interval:.0f}s", "Rate limited: no"],
+                    color=0x57F287,
+                )
+            else:
+                print(f"Equipped \"{outfit['name']}\" ({outfit['id']}). Next change in {interval:.0f}s.")
+                _log(f"equipped id={outfit['id']} name={outfit['name']} status={result.status}")
+                _notify(
+                    "Outfit swapped",
+                    [
+                        f"Outfit: {outfit['name']}",
+                        f"ID: {outfit['id']}",
+                        f"Status: {result.status}",
+                        f"Next swap: {interval:.0f}s",
+                        "Rate limited: no",
+                    ],
+                    color=0x57F287,
+                )
             state["last_outfit_id"] = outfit["id"]
             state["last_outfit_name"] = outfit["name"]
             state["last_status"] = result.status
 
-        state["next_index"] = (index + 1) % len(selected)
+        if selected and not random_mode:
+            state["next_index"] = (index + 1) % len(selected)
         state["interval_seconds"] = interval
         _save_state(state)
 
@@ -240,12 +356,85 @@ def run_loop(client: RobloxClient, selected: list[dict[str, Any]], config: dict[
         if bio_decision == "wait":
             continue
 
+        if config["remove_badges"]:
+            badge_decision = _update_badges(client, state)
+            if badge_decision == "stop":
+                return 1
+
         extra = result.wait_seconds if result.ok else 0
         sleep_for = max(interval, extra)
         if extra > interval:
             print(f"Rate-limit budget is empty. Waiting {sleep_for:.0f}s before the next outfit.")
             _log(f"budget-wait {sleep_for:.0f}s")
+            _notify(
+                "Rate limit budget empty",
+                [f"Waiting {sleep_for:.0f}s before the next outfit.", "Rate limited: yes"],
+                color=0xFEE75C,
+            )
         _sleep(sleep_for)
+
+
+def _load_wardrobe(client: RobloxClient) -> dict[str, Any]:
+    """Rules plus owned wearables. The current avatar is kept even if inventory is limited."""
+    rules_result = client.avatar_rules()
+    if rules_result.rate_limited:
+        raise RobloxError(
+            "Roblox rate limited the avatar rules. Waiting, then trying again.",
+            429,
+            transient=True,
+        )
+    rules = parse_avatar_rules(rules_result.payload if rules_result.ok else {})
+    if not rules["scales"]:
+        rules["scales"] = {
+            "height": {"min": 0.9, "max": 1.05, "increment": 0.01},
+            "width": {"min": 0.7, "max": 1.0, "increment": 0.01},
+            "head": {"min": 0.95, "max": 1.0, "increment": 0.01},
+            "proportion": {"min": 0.0, "max": 1.0, "increment": 0.01},
+            "bodyType": {"min": 0.0, "max": 1.0, "increment": 0.01},
+        }
+    current = client.current_avatar()
+    if current.rate_limited:
+        raise RobloxError(
+            "Roblox rate limited the current avatar. Waiting, then trying again.",
+            429,
+            transient=True,
+        )
+    grouped: dict[int, list[int]] = {}
+    if current.ok and isinstance(current.payload, dict):
+        absorb_wearables(grouped, current.payload.get("assets"))
+    if client.user_id is not None:
+        owned, limited = client.list_owned_assets(client.user_id)
+        for type_id, asset_ids in owned.items():
+            for asset_id in asset_ids:
+                add_owned_asset(grouped, type_id, asset_id)
+        if limited is not None:
+            print("Inventory scan was rate limited. Using the items already collected.")
+            _log("inventory-rate-limit")
+    if 27 not in grouped:
+        raise RobloxError("Could not read the current body, so the avatar was left alone.")
+    total = sum(len(asset_ids) for asset_ids in grouped.values())
+    print(f"Randomizer loaded {total} owned items.")
+    _log(f"wardrobe items={total}")
+    return {"assets": grouped, "rules": rules}
+
+
+def _forget_assets(wardrobe: dict[str, Any], asset_ids: list[int]) -> None:
+    banned = set(asset_ids)
+    if not banned:
+        return
+    grouped = wardrobe.get("assets")
+    if not isinstance(grouped, dict):
+        return
+    for type_id, owned in list(grouped.items()):
+        grouped[type_id] = [asset_id for asset_id in owned if asset_id not in banned]
+
+
+def _look_label(look: dict[str, Any]) -> str:
+    scales = look.get("scales") or {}
+    scale_text = ", ".join(f"{name} {value:g}" for name, value in scales.items())
+    colors = look.get("colors") or {}
+    color_text = ", ".join(f"{name} {value}" for name, value in colors.items())
+    return f"{look.get('asset_count', 0)} items; {scale_text}; {color_text}"
 
 
 def _update_bio(
@@ -254,10 +443,10 @@ def _update_bio(
     config: dict[str, Any],
     interval: float,
 ) -> str:
-    """Set a new one-line bio when its own timer is due.
+    """Set a new bio when its own timer is due.
 
-    A description 429 lengthens only the bio gap. Outfit changes keep the
-    interval from config.json.
+    A description 429 lengthens only the bio gap and that slower pace stays.
+    Outfit changes keep the interval from config.json.
     """
     now = time.time()
     due = state.get("bio_next_at")
@@ -274,47 +463,225 @@ def _update_bio(
             return "ok"
         print(exc)
         _log(f"auth-stop {exc}")
+        _notify("Manager stopped", [str(exc)[:300]], color=0xED4245)
         return "stop"
 
     if result.rate_limited:
-        current = state.get("bio_interval_seconds")
-        gap_now = float(current) if isinstance(current, (int, float)) and not isinstance(current, bool) else interval
-        wait, gap = schedule_bio_after_limit(
+        gap_now = optional_seconds(state.get("bio_interval_seconds")) or interval
+        pace = adapt_bio_pace(
             gap_now,
-            result.retry_after,
-            result.wait_seconds,
-            config["max_interval_seconds"],
+            accepted=False,
+            maximum=config["max_interval_seconds"],
+            retry_after=result.retry_after,
+            header_wait=result.wait_seconds,
+            blocked_seconds=optional_seconds(state.get("bio_blocked_seconds")),
         )
-        state["bio_interval_seconds"] = gap
-        state["bio_next_at"] = time.time() + wait
-        _save_state(state)
+        _store_bio_pace(state, pace)
         message = (
-            f"Rate limited while updating the bio. Next bio in {wait:.0f}s. "
-            f"Outfits stay at {interval:.0f}s."
+            f"Rate limited while updating the bio. Next bio in {pace.wait_seconds:.0f}s, "
+            f"and it stays there. Outfits stay at {interval:.0f}s."
         )
         print(message)
         _log(message)
+        _notify(
+            "Bio rate limited",
+            [
+                f"Next bio: {pace.wait_seconds:.0f}s",
+                "That pace stays",
+                f"Outfits stay at {interval:.0f}s",
+                "Rate limited: yes",
+            ],
+            color=0xFEE75C,
+        )
         return "ok"
 
     if result.status == 401:
         print("The cookie expired. Paste a new .ROBLOSECURITY value into .env and start again.")
         _log("cookie expired")
+        _notify("Cookie expired", ["Paste a new .ROBLOSECURITY value into .env."], color=0xED4245)
         return "stop"
 
     if not result.ok:
         print(f"Bio was not changed: {result.status} {result.message}")
         _log(f"bio-fail status={result.status} {result.message}")
+        _notify(
+            "Bio failed",
+            [f"Status: {result.status}", str(result.message)[:300]],
+            color=0xED4245,
+        )
         return "ok"
 
-    gap = state.get("bio_interval_seconds")
-    current_gap = float(gap) if isinstance(gap, (int, float)) and not isinstance(gap, bool) else interval
-    bio_gap = relax_bio_gap(current_gap, interval)
-    state["bio_interval_seconds"] = bio_gap
-    state["bio_next_at"] = time.time() + bio_gap
-    _save_state(state)
-    print(f"Updated bio ({len(text)} chars). Next bio in {bio_gap:.0f}s.")
-    _log(f"bio status={result.status} len={len(text)}")
+    current_gap = optional_seconds(state.get("bio_interval_seconds")) or BIO_START_SECONDS
+    pace = adapt_bio_pace(
+        current_gap,
+        accepted=True,
+        maximum=config["max_interval_seconds"],
+        blocked_seconds=optional_seconds(state.get("bio_blocked_seconds")),
+    )
+    _store_bio_pace(state, pace)
+    print(f"Updated bio ({len(text)} chars). Next bio in {pace.gap_seconds:.0f}s.")
+    _log(f"bio status={result.status} len={len(text)} next={pace.gap_seconds:.0f}s")
+    _notify(
+        "Bio changed",
+        [
+            f"Length: {len(text)}",
+            f"Next bio: {pace.gap_seconds:.0f}s",
+            "Rate limited: no",
+            text[:180],
+        ],
+        color=0x5865F2,
+    )
     return "ok"
+
+
+def _update_badges(client: RobloxClient, state: dict[str, Any]) -> str:
+    """Remove owned badges one at a time. An empty account is checked rarely."""
+    now = time.time()
+    due = optional_seconds(state.get("badge_next_at"))
+    if due is not None and now < due:
+        return "ok"
+
+    queue = _badge_queue(state)
+    if not queue:
+        if client.user_id is None:
+            return "ok"
+        try:
+            listed = client.list_badge_ids(client.user_id)
+        except RobloxError as exc:
+            if exc.transient:
+                print(f"{exc}")
+                _log(f"badge-network-wait {exc}")
+                state["badge_next_at"] = time.time() + BADGE_IDLE_SECONDS
+                _save_state(state)
+                return "ok"
+            print(exc)
+            _log(f"auth-stop {exc}")
+            _notify("Manager stopped", [str(exc)[:300]], color=0xED4245)
+            return "stop"
+        if listed.rate_limited:
+            return _badge_limited(state, listed.retry_after, listed.wait_seconds, "listing badges")
+        if listed.status == 401:
+            print("The cookie expired. Paste a new .ROBLOSECURITY value into .env and start again.")
+            _log("cookie expired")
+            _notify("Cookie expired", ["Paste a new .ROBLOSECURITY value into .env."], color=0xED4245)
+            return "stop"
+        if not listed.ok or not isinstance(listed.payload, list):
+            print(f"Could not list badges: {listed.status} {listed.message}")
+            _log(f"badge-list-fail status={listed.status} {listed.message}")
+            state["badge_next_at"] = time.time() + BADGE_IDLE_SECONDS
+            _save_state(state)
+            return "ok"
+        queue = [int(item) for item in listed.payload if isinstance(item, int) and item > 0]
+        if not queue:
+            state["badge_queue"] = []
+            state["badge_next_at"] = time.time() + BADGE_IDLE_SECONDS
+            if not state.get("badge_idle_announced"):
+                state["badge_idle_announced"] = True
+                message = f"No badges left. Next check in {BADGE_IDLE_SECONDS / 3600:.0f}h."
+                print(message)
+                _log(message)
+                _notify("Badges clear", [message, "Rate limited: no"], color=0x57F287, webhook_env="DISCORD_BADGE_WEBHOOK_URL")
+            else:
+                print(f"No badges. Next check in {BADGE_IDLE_SECONDS / 3600:.0f}h.")
+            _save_state(state)
+            return "ok"
+        state["badge_idle_announced"] = False
+        state["badge_queue"] = list(queue)
+        _save_state(state)
+        message = (
+            f"Found {len(queue)} badges. Removing one every {BADGE_DELETE_SECONDS:.0f}s. "
+            "Roblox has no remove-all call."
+        )
+        print(message)
+        _log(message)
+        _notify("Removing badges", [message], color=0x5865F2, webhook_env="DISCORD_BADGE_WEBHOOK_URL")
+
+    badge_id = queue.pop(0)
+    try:
+        result = client.delete_badge(badge_id)
+    except RobloxError as exc:
+        queue.insert(0, badge_id)
+        state["badge_queue"] = queue
+        if exc.transient:
+            print(f"{exc}")
+            _log(f"badge-network-wait {exc}")
+            state["badge_next_at"] = time.time() + BADGE_DELETE_SECONDS
+            _save_state(state)
+            return "ok"
+        print(exc)
+        _log(f"auth-stop {exc}")
+        _notify("Manager stopped", [str(exc)[:300]], color=0xED4245)
+        _save_state(state)
+        return "stop"
+
+    if result.rate_limited:
+        queue.insert(0, badge_id)
+        state["badge_queue"] = queue
+        return _badge_limited(state, result.retry_after, result.wait_seconds, f"removing badge {badge_id}")
+    if result.status == 401:
+        print("The cookie expired. Paste a new .ROBLOSECURITY value into .env and start again.")
+        _log("cookie expired")
+        _notify("Cookie expired", ["Paste a new .ROBLOSECURITY value into .env."], color=0xED4245)
+        return "stop"
+    if not result.ok:
+        state["badge_queue"] = queue
+        state["badge_next_at"] = time.time() + badge_pause_seconds(len(queue), limited=False)
+        _save_state(state)
+        print(f"Skipped badge {badge_id}: {result.status} {result.message}")
+        _log(f"badge-skip id={badge_id} status={result.status} {result.message}")
+        return "ok"
+
+    state["badge_queue"] = queue
+    pause = badge_pause_seconds(len(queue), limited=False)
+    state["badge_next_at"] = time.time() + pause
+    _save_state(state)
+    if queue:
+        message = f"Removed badge {badge_id}. {len(queue)} left. Next removal in {pause:.0f}s."
+        print(message)
+        _log(f"badge-removed id={badge_id} left={len(queue)}")
+        _notify("Badge removed", [message, "Rate limited: no"], color=0x57F287, webhook_env="DISCORD_BADGE_WEBHOOK_URL")
+        return "ok"
+    message = f"Removed badge {badge_id}. No badges left. Next check in {pause / 3600:.0f}h."
+    print(message)
+    _log(message)
+    state["badge_idle_announced"] = True
+    _save_state(state)
+    _notify("Badges clear", [message, "Rate limited: no"], color=0x57F287, webhook_env="DISCORD_BADGE_WEBHOOK_URL")
+    return "ok"
+
+
+def _badge_limited(state: dict[str, Any], retry_after: float | None, header_wait: float, action: str) -> str:
+    pause = badge_pause_seconds(1, limited=True, retry_after=retry_after, header_wait=header_wait)
+    state["badge_next_at"] = time.time() + pause
+    _save_state(state)
+    message = f"Rate limited while {action}. Next badge request in {pause:.0f}s."
+    print(message)
+    _log(message)
+    _notify(
+        "Badge rate limited",
+        [message, "Rate limited: yes"],
+        color=0xFEE75C,
+        webhook_env="DISCORD_BADGE_WEBHOOK_URL",
+    )
+    return "ok"
+
+
+def _badge_queue(state: dict[str, Any]) -> list[int]:
+    raw = state.get("badge_queue")
+    if not isinstance(raw, list):
+        return []
+    queue: list[int] = []
+    for item in raw:
+        if isinstance(item, int) and not isinstance(item, bool) and item > 0:
+            queue.append(item)
+    return queue
+
+
+def _store_bio_pace(state: dict[str, Any], pace: Any) -> None:
+    state["bio_interval_seconds"] = pace.gap_seconds
+    state["bio_blocked_seconds"] = pace.blocked_seconds
+    state["bio_next_at"] = time.time() + pace.wait_seconds
+    _save_state(state)
 
 
 def _record_rate_limit(
@@ -350,6 +717,16 @@ def _record_rate_limit(
     )
     print(message)
     _log(message)
+    _notify(
+        "Outfit rate limited",
+        [
+            f"Outfit: {outfit['name']}",
+            f"Pause: {pause_for:.0f}s",
+            f"Interval: {interval:.0f}s -> {new_interval:.0f}s",
+            "Rate limited: yes",
+        ],
+        color=0xFEE75C,
+    )
     if config["on_rate_limit"] == "stop":
         print("on_rate_limit is stop, so this process is exiting. Raise interval_seconds, then run it again.")
         return "stop"
@@ -421,9 +798,35 @@ def _config_path(raw: str) -> Path:
     return path
 
 
-def _cookie() -> str:
-    import os
+def _notify(title: str, lines: list[str], *, color: int, webhook_env: str = "DISCORD_WEBHOOK_URL") -> None:
+    """Post one status embed. A missing webhook, or a Discord error, does not stop the loop."""
+    url = os.environ.get(webhook_env, "").strip()
+    if not (
+        url.startswith("https://discord.com/api/webhooks/")
+        or url.startswith("https://discordapp.com/api/webhooks/")
+    ):
+        return
+    payload = {
+        "username": "RobloxProfileManager",
+        "embeds": [
+            {
+                "title": title[:256],
+                "description": "\n".join(lines)[:4000],
+                "color": color,
+            }
+        ],
+    }
 
+    def _send() -> None:
+        try:
+            requests.post(url, json=payload, timeout=8)
+        except requests.RequestException as exc:
+            _log(f"discord-notify-failed {type(exc).__name__}")
+
+    threading.Thread(target=_send, daemon=True).start()
+
+
+def _cookie() -> str:
     from_env = normalize_cookie(os.environ.get("ROBLOSECURITY", ""))
     if from_env.startswith("_|WARNING"):
         return from_env

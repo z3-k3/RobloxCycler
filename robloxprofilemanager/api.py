@@ -8,7 +8,15 @@ from typing import Any
 
 import requests
 
-from robloxprofilemanager.logic import header_wait_seconds, parse_retry_after, roblox_error_text, v4_wear_body
+from robloxprofilemanager.logic import (
+    OWNED_SCAN_TYPES,
+    add_owned_asset,
+    header_wait_seconds,
+    parse_badge_id,
+    parse_retry_after,
+    roblox_error_text,
+    v4_wear_body,
+)
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -34,6 +42,7 @@ class CallResult:
     wait_seconds: float = 0.0
     payload: Any = None
     headers: dict[str, str] = field(default_factory=dict)
+    removed_ids: list[int] = field(default_factory=list)
 
 
 class RobloxClient:
@@ -153,6 +162,55 @@ class RobloxClient:
             result.message = f"Roblox refused some items in this outfit ({len(invalid)} invalid)."
         return result
 
+    def current_avatar(self) -> CallResult:
+        return self._request("GET", "https://avatar.roblox.com/v1/avatar")
+
+    def avatar_rules(self) -> CallResult:
+        return self._request("GET", "https://avatar.roblox.com/v1/avatar-rules")
+
+    def list_owned_assets(self, user_id: int) -> tuple[dict[int, list[int]], CallResult | None]:
+        """One page per wearable type. A 429 stops the scan and returns what was found."""
+        grouped: dict[int, list[int]] = {}
+        for asset_type in OWNED_SCAN_TYPES:
+            result = self._request(
+                "GET",
+                f"https://inventory.roblox.com/v2/users/{user_id}/inventory/{asset_type}",
+                params={"limit": 100, "sortOrder": "Desc"},
+            )
+            if result.rate_limited:
+                return grouped, result
+            if not result.ok or not isinstance(result.payload, dict):
+                continue
+            for item in result.payload.get("data") or []:
+                if not isinstance(item, dict):
+                    continue
+                raw_id = item.get("assetId", item.get("id"))
+                if isinstance(raw_id, int) and not isinstance(raw_id, bool):
+                    add_owned_asset(grouped, asset_type, raw_id)
+        return grouped, None
+
+    def wear_body(self, body: dict[str, Any], fallback: dict[str, Any] | None = None) -> CallResult:
+        """Apply an avatar. Items Roblox refuses are removed and the rest is sent again."""
+        removed: list[int] = []
+        result = _mark_invalid_assets(self._request("PATCH", "https://avatar.roblox.com/v4/avatar", json_body=body))
+        if not result.ok and not result.rate_limited and result.status != 401:
+            removed.extend(_invalid_asset_ids(result))
+            stripped = _without_assets(body, set(removed))
+            if stripped != body:
+                result = _mark_invalid_assets(
+                    self._request("PATCH", "https://avatar.roblox.com/v4/avatar", json_body=stripped)
+                )
+                removed.extend(_invalid_asset_ids(result))
+        if not result.ok and not result.rate_limited and result.status != 401 and fallback is not None:
+            plain = _without_assets(fallback, set(removed))
+            if plain != body:
+                result = _mark_invalid_assets(
+                    self._request("PATCH", "https://avatar.roblox.com/v4/avatar", json_body=plain)
+                )
+                removed.extend(_invalid_asset_ids(result))
+        result.removed_ids = list(dict.fromkeys(removed))
+        return result
+
     def set_description(self, description: str) -> CallResult:
         text = description.replace("\n", "").replace("\r", "")[:1000]
         return self._request(
@@ -160,6 +218,34 @@ class RobloxClient:
             "https://users.roblox.com/v1/description",
             json_body={"description": text},
         )
+
+    def list_badge_ids(self, user_id: int) -> CallResult:
+        """Every awarded badge id. Roblox pages these; there is no clear-all call."""
+        found: list[int] = []
+        cursor = ""
+        for _ in range(40):
+            params: dict[str, Any] = {"limit": 100, "sortOrder": "Asc"}
+            if cursor:
+                params["cursor"] = cursor
+            result = self._request(
+                "GET",
+                f"https://badges.roblox.com/v1/users/{user_id}/badges",
+                params=params,
+            )
+            if not result.ok or not isinstance(result.payload, dict):
+                return result
+            for item in result.payload.get("data") or []:
+                if isinstance(item, dict):
+                    badge_id = parse_badge_id(item.get("id"))
+                    if badge_id is not None:
+                        found.append(badge_id)
+            cursor = str(result.payload.get("nextPageCursor") or "")
+            if not cursor:
+                break
+        return CallResult(ok=True, status=200, message="", payload=found)
+
+    def delete_badge(self, badge_id: int) -> CallResult:
+        return self._request("DELETE", f"https://badges.roblox.com/v1/user/badges/{badge_id}")
 
     def _request(
         self,
@@ -227,6 +313,52 @@ def _json_or_empty(response: requests.Response) -> Any:
         return response.json()
     except ValueError:
         return None
+
+
+def _invalid_asset_ids(result: CallResult) -> list[int]:
+    payload = result.payload if isinstance(result.payload, dict) else {}
+    raw = payload.get("invalidAssets") or payload.get("invalidAssetIds") or []
+    if not isinstance(raw, list):
+        return []
+    found: list[int] = []
+    for item in raw:
+        if isinstance(item, bool):
+            continue
+        if isinstance(item, int):
+            found.append(item)
+        elif isinstance(item, dict) and isinstance(item.get("id"), int) and not isinstance(item.get("id"), bool):
+            found.append(item["id"])
+    return found
+
+
+def _without_assets(body: dict[str, Any], banned: set[int]) -> dict[str, Any]:
+    if not banned:
+        return body
+    model = body.get("avatarDefinition", {}).get("updateAvatarModel", {})
+    assets = model.get("assets")
+    if not isinstance(assets, list):
+        return body
+    kept = [asset for asset in assets if not (isinstance(asset, dict) and asset.get("id") in banned)]
+    if len(kept) == len(assets):
+        return body
+    copy = {
+        "updateTypes": list(body.get("updateTypes") or []),
+        "avatarDefinition": {"updateAvatarModel": {key: value for key, value in model.items() if key != "assets"}},
+    }
+    if kept:
+        copy["avatarDefinition"]["updateAvatarModel"]["assets"] = kept
+    return copy
+
+
+def _mark_invalid_assets(result: CallResult) -> CallResult:
+    if not result.ok or not isinstance(result.payload, dict):
+        return result
+    if result.payload.get("success") is False:
+        invalid = result.payload.get("invalidAssets") or result.payload.get("invalidAssetIds") or []
+        result.ok = False
+        count = len(invalid) if isinstance(invalid, list) else 0
+        result.message = result.message or f"Roblox refused some items ({count} invalid)."
+    return result
 
 
 def _to_result(response: requests.Response) -> CallResult:

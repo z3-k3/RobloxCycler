@@ -1,15 +1,22 @@
-"""Pure decisions for interval, cooldown, and outfit selection."""
+"""Pure decisions for interval, cooldown, outfit selection, and bio pace."""
 
 from __future__ import annotations
 
 import json
+import math
 import random
+from dataclasses import dataclass
 from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any
 
 MIN_INTERVAL_SECONDS = 5
 DEFAULT_MAX_INTERVAL_SECONDS = 300
+BIO_START_SECONDS = 60.0
+BIO_HOLD_RATIO = 1.15
+BIO_HOLD_PAD = 8.0
+BADGE_DELETE_SECONDS = 20.0
+BADGE_IDLE_SECONDS = 2 * 60 * 60.0
 
 
 class ConfigError(ValueError):
@@ -166,9 +173,106 @@ def clamp_interval(seconds: float, maximum: float) -> float:
     return min(ceiling, max(MIN_INTERVAL_SECONDS, float(seconds)))
 
 
-def relax_bio_gap(current_gap: float, target: float) -> float:
-    """After Roblox accepts a bio, go back to the normal gap instead of staying slowed."""
-    return max(float(target), MIN_INTERVAL_SECONDS)
+@dataclass(frozen=True)
+class BioPace:
+    """How long to wait, the gap to keep, and the pace Roblox refused."""
+
+    wait_seconds: float
+    gap_seconds: float
+    blocked_seconds: float | None
+
+
+def optional_seconds(value: Any) -> float | None:
+    """A state-file number, or None when the field is missing."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value)
+
+
+def prepared_bio_gap(
+    saved_gap: float | None,
+    blocked: float | None,
+    maximum: float,
+) -> tuple[float, float | None]:
+    """The bio gap to keep on startup. Never faster than the description floor."""
+    gap = BIO_START_SECONDS if saved_gap is None else max(float(saved_gap), BIO_START_SECONDS)
+    remembered = None
+    if blocked is not None and float(blocked) > 0:
+        remembered = max(float(blocked), BIO_START_SECONDS)
+        gap = max(gap, remembered)
+    gap = clamp_interval(gap, maximum)
+    if remembered is not None:
+        remembered = clamp_interval(remembered, maximum)
+    return gap, remembered
+
+
+def refusal_hold_seconds(floor: float, maximum: float) -> float:
+    """A pace a little slower than the window Roblox just enforced."""
+    base = max(float(floor), BIO_START_SECONDS)
+    padded = max(base * BIO_HOLD_RATIO, base + BIO_HOLD_PAD)
+    return clamp_interval(math.ceil(padded - 1e-9), maximum)
+
+
+def adapt_bio_pace(
+    current_gap: float,
+    *,
+    accepted: bool,
+    maximum: float,
+    retry_after: float | None = None,
+    header_wait: float = 0.0,
+    blocked_seconds: float | None = None,
+) -> BioPace:
+    """Keep description updates slower than the pace that gets a 429.
+
+    The outfit interval is not the bio pace. A refusal becomes the new hold,
+    with headroom past Retry-After, and a later success does not speed back up
+    through that hold.
+    """
+    current = clamp_interval(max(float(current_gap), BIO_START_SECONDS), maximum)
+    blocked = None
+    if blocked_seconds is not None and float(blocked_seconds) > 0:
+        blocked = clamp_interval(max(float(blocked_seconds), BIO_START_SECONDS), maximum)
+
+    if not accepted:
+        floor = max(current, float(retry_after or 0), float(header_wait or 0))
+        if (retry_after is None or retry_after <= 0) and float(header_wait or 0) <= 0:
+            floor = max(floor, slowed_interval(current, 2, maximum))
+        gap = refusal_hold_seconds(floor, maximum)
+        if blocked is not None:
+            gap = clamp_interval(max(gap, blocked), maximum)
+        return BioPace(wait_seconds=gap, gap_seconds=gap, blocked_seconds=gap)
+
+    safe = blocked if blocked is not None else clamp_interval(BIO_START_SECONDS, maximum)
+    if current > safe + 1:
+        gap = clamp_interval(max(safe, safe + (current - safe) * 0.5), maximum)
+    else:
+        gap = clamp_interval(max(current, safe), maximum)
+    return BioPace(wait_seconds=gap, gap_seconds=gap, blocked_seconds=blocked)
+
+
+def badge_pause_seconds(
+    remaining: int,
+    *,
+    limited: bool,
+    retry_after: float | None = None,
+    header_wait: float = 0.0,
+) -> float:
+    """One delete while badges remain. A long quiet check once they are gone."""
+    if limited:
+        return max(BADGE_DELETE_SECONDS, 60.0, float(retry_after or 0), float(header_wait or 0))
+    if remaining <= 0:
+        return BADGE_IDLE_SECONDS
+    return BADGE_DELETE_SECONDS
+
+
+def parse_badge_id(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int) and value > 0:
+        return value
+    if isinstance(value, str) and value.isdigit() and int(value) > 0:
+        return int(value)
+    return None
 
 
 def schedule_bio_after_limit(
@@ -178,10 +282,14 @@ def schedule_bio_after_limit(
     maximum: float,
 ) -> tuple[float, float]:
     """Wait and the next bio gap after a description 429. The outfit gap stays put."""
-    gap = slowed_interval(max(float(current_gap), MIN_INTERVAL_SECONDS), 2, maximum)
-    pause = MIN_INTERVAL_SECONDS if retry_after is None else max(0.0, float(retry_after))
-    wait = max(pause, float(header_wait or 0), gap)
-    return wait, gap
+    pace = adapt_bio_pace(
+        current_gap,
+        accepted=False,
+        maximum=maximum,
+        retry_after=retry_after,
+        header_wait=header_wait,
+    )
+    return pace.wait_seconds, pace.gap_seconds
 
 
 def slowed_interval(current: float, factor: float, maximum: float) -> float:
@@ -240,6 +348,10 @@ def read_config(path: Path) -> dict[str, Any]:
     if not isinstance(outfit_ids, list) or not all(isinstance(item, int) and not isinstance(item, bool) and item > 0 for item in outfit_ids):
         raise ConfigError("outfit_ids must be a list of positive outfit id numbers, or [].")
 
+    mode = str(raw.get("avatar_mode", "cycle")).strip().lower()
+    if mode not in {"cycle", "random"}:
+        raise ConfigError('avatar_mode must be "cycle" or "random".')
+
     return {
         "interval_seconds": interval,
         "max_interval_seconds": max(maximum, MIN_INTERVAL_SECONDS),
@@ -247,6 +359,8 @@ def read_config(path: Path) -> dict[str, Any]:
         "on_rate_limit": action,
         "request_timeout_seconds": timeout,
         "outfit_ids": outfit_ids,
+        "avatar_mode": mode,
+        "remove_badges": bool(raw.get("remove_badges", False)),
         "interval_was_raised": interval < MIN_INTERVAL_SECONDS,
     }
 
@@ -301,6 +415,231 @@ def wear_assets(assets: Any) -> list[dict[str, Any]]:
             item["meta"] = meta
         cleaned.append(item)
     return cleaned
+
+
+# Asset type ids from Roblox avatar rules. Body parts stay at one each.
+BODY_PART_TYPES = (27, 28, 29, 30, 31)
+HEAD_TYPES = (79, 17)
+STACK_TYPES = (8, 41, 42, 43, 44, 45, 46, 47, 64, 65, 66, 67, 68, 69, 72, 76, 77, 88, 89, 90)
+OWNED_SCAN_TYPES = HEAD_TYPES + BODY_PART_TYPES + (18, 11, 12) + STACK_TYPES
+# Far-apart entries from the public body-color palette. Nearby skin tones get rejected.
+_HARSH_COLORS = (
+    "#111111",
+    "#F8F8F8",
+    "#00FF00",
+    "#FF0000",
+    "#0000FF",
+    "#FF00BF",
+    "#FFFF00",
+    "#00FFFF",
+    "#AA00AA",
+    "#FFAF00",
+)
+_COLOR_FIELDS = (
+    "headColor",
+    "torsoColor",
+    "rightArmColor",
+    "leftArmColor",
+    "rightLegColor",
+    "leftLegColor",
+)
+_SCALE_PRESETS = (
+    {"height": "max", "width": "min", "head": "max", "proportion": "min", "bodyType": "max"},
+    {"height": "max", "width": "min", "head": "min", "proportion": "max", "bodyType": "min"},
+    {"height": "min", "width": "max", "head": "max", "proportion": "max", "bodyType": "min"},
+    {"height": "min", "width": "max", "head": "min", "proportion": "min", "bodyType": "max"},
+    {"height": "max", "width": "max", "head": "max", "proportion": "min", "bodyType": "min"},
+    {"height": "max", "width": "min", "head": "max", "proportion": "max", "bodyType": "max"},
+)
+
+
+def asset_type_id(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, dict):
+        raw = value.get("id")
+        if isinstance(raw, int) and not isinstance(raw, bool):
+            return raw
+    return None
+
+
+def add_owned_asset(grouped: dict[int, list[int]], asset_type: int, asset_id: int) -> None:
+    if asset_type <= 0 or asset_id <= 0:
+        return
+    bucket = grouped.setdefault(asset_type, [])
+    if asset_id not in bucket:
+        bucket.append(asset_id)
+
+
+def absorb_wearables(grouped: dict[int, list[int]], assets: Any) -> None:
+    if not isinstance(assets, list):
+        return
+    for asset in assets:
+        if not isinstance(asset, dict):
+            continue
+        raw_id = asset.get("id", asset.get("assetId"))
+        type_id = asset_type_id(asset.get("assetType"))
+        if isinstance(raw_id, bool) or not isinstance(raw_id, int) or type_id is None:
+            continue
+        add_owned_asset(grouped, type_id, raw_id)
+
+
+def parse_avatar_rules(payload: Any) -> dict[str, Any]:
+    """Pull the scale caps, slot limits, and allowed body colors out of avatar rules."""
+    scales: dict[str, dict[str, float]] = {}
+    limits: dict[int, int] = {}
+    colors: list[str] = []
+    if not isinstance(payload, dict):
+        return {"scales": scales, "limits": limits, "colors": colors}
+    raw_scales = payload.get("scales")
+    if isinstance(raw_scales, dict):
+        for name, spec in raw_scales.items():
+            if not isinstance(name, str) or not isinstance(spec, dict):
+                continue
+            try:
+                low = float(spec["min"])
+                high = float(spec["max"])
+                step = float(spec.get("increment") or 0.01)
+            except (KeyError, TypeError, ValueError):
+                continue
+            if high < low or step <= 0:
+                continue
+            scales[name] = {"min": low, "max": high, "increment": step}
+    for item in payload.get("wearableAssetTypes") or []:
+        if not isinstance(item, dict):
+            continue
+        type_id = item.get("id")
+        if isinstance(type_id, bool) or not isinstance(type_id, int):
+            continue
+        try:
+            limits[type_id] = max(0, int(item.get("maxNumber") or 0))
+        except (TypeError, ValueError):
+            continue
+    for item in payload.get("bodyColorsPalette") or []:
+        if isinstance(item, dict) and isinstance(item.get("hexColor"), str) and item["hexColor"].strip():
+            colors.append(item["hexColor"].strip())
+    return {"scales": scales, "limits": limits, "colors": colors}
+
+
+def freaky_avatar(
+    grouped: dict[int, list[int]],
+    rules: dict[str, Any],
+    rng: random.Random,
+) -> dict[str, Any]:
+    """One legal-but-wrong avatar: extreme sliders, clashing colors, every slot filled.
+
+    Roblox rejects scales outside avatar rules, so each slider is only min or max.
+    `fallback` keeps the body parts and face when the piled-on version is refused.
+    """
+    scales = _extreme_scales(rules.get("scales") or {}, rng)
+    colors = _clashing_colors(rules.get("colors") or [], rng)
+    limits = rules.get("limits") if isinstance(rules.get("limits"), dict) else {}
+    full = _pick_assets(grouped, limits, rng, stacked=True)
+    plain = _pick_assets(grouped, limits, rng, stacked=False)
+    return {
+        "body": _avatar_body(full, scales, colors),
+        "fallback": _avatar_body(plain, scales, colors),
+        "scales": scales,
+        "colors": colors,
+        "asset_count": len(full),
+    }
+
+
+def _extreme_scales(scale_rules: dict[str, Any], rng: random.Random) -> dict[str, float]:
+    preset = dict(rng.choice(_SCALE_PRESETS))
+    chosen: dict[str, float] = {}
+    for name, spec in scale_rules.items():
+        if not isinstance(spec, dict):
+            continue
+        end = preset.get(name, rng.choice(("min", "max")))
+        if rng.random() < 0.25:
+            end = "min" if end == "max" else "max"
+        try:
+            chosen[name] = _snap_scale(spec, end)
+        except (KeyError, TypeError, ValueError):
+            continue
+    return chosen
+
+
+def _snap_scale(spec: dict[str, Any], end: str) -> float:
+    low = float(spec["min"])
+    high = float(spec["max"])
+    step = float(spec.get("increment") or 0.01)
+    if step <= 0:
+        step = 0.01
+    target = high if end == "max" else low
+    steps = round((target - low) / step)
+    value = min(high, max(low, low + steps * step))
+    return round(value, 4)
+
+
+def _clashing_colors(palette: list[str], rng: random.Random) -> dict[str, str]:
+    allowed = {color.lower(): color for color in palette}
+    pool = [allowed[color.lower()] for color in _HARSH_COLORS if color.lower() in allowed]
+    if len(pool) < len(_COLOR_FIELDS):
+        pool = list(palette)
+    rng.shuffle(pool)
+    if not pool:
+        return {}
+    return {field: pool[index % len(pool)] for index, field in enumerate(_COLOR_FIELDS)}
+
+
+def _pick_assets(
+    grouped: dict[int, list[int]],
+    limits: dict[Any, Any],
+    rng: random.Random,
+    *,
+    stacked: bool,
+) -> list[tuple[int, int]]:
+    chosen: list[tuple[int, int]] = []
+    used: set[int] = set()
+
+    def take(type_id: int, count: int) -> None:
+        pool = [asset_id for asset_id in grouped.get(type_id, []) if asset_id not in used]
+        if count <= 0 or not pool:
+            return
+        rng.shuffle(pool)
+        for asset_id in pool[:count]:
+            used.add(asset_id)
+            chosen.append((type_id, asset_id))
+
+    head_type = 79 if grouped.get(79) and (not grouped.get(17) or rng.random() < 0.75) else 17
+    if not grouped.get(head_type):
+        head_type = 17 if grouped.get(17) else 79
+    take(head_type, 1)
+    for type_id in BODY_PART_TYPES:
+        take(type_id, 1)
+    take(18, 1)
+    if not stacked:
+        return chosen
+    for type_id in STACK_TYPES:
+        cap = limits.get(type_id, 1)
+        try:
+            cap = int(cap)
+        except (TypeError, ValueError):
+            cap = 1
+        take(type_id, cap)
+    if rng.random() < 0.35:
+        take(11, 1)
+        take(12, 1)
+    return chosen
+
+
+def _avatar_body(
+    picks: list[tuple[int, int]],
+    scales: dict[str, float],
+    colors: dict[str, str],
+) -> dict[str, Any]:
+    model: dict[str, Any] = {"playerAvatarType": 3}
+    if scales:
+        model["scales"] = scales
+    if colors:
+        model["bodyColors"] = colors
+    if picks:
+        model["assets"] = [{"id": asset_id} for _, asset_id in picks]
+    return {"updateTypes": [0, 2, 3, 4], "avatarDefinition": {"updateAvatarModel": model}}
 
 
 def v4_wear_body(details: dict[str, Any]) -> dict[str, Any]:
@@ -380,35 +719,7 @@ def select_outfits(merged: list[dict[str, Any]], outfit_ids: list[int]) -> list[
     return [item for item in merged if item.get("enabled", True)]
 
 
-_BIO_STEMS = (
-    "SYSTEM",
-    "UNKNOWN",
-    "VOID",
-    "SIGNAL",
-    "LOST",
-    "NULL",
-    "TRACE",
-    "BUFFER",
-    "PACKET",
-    "OFFSET",
-    "SECTOR",
-    "NODE",
-    "RELAY",
-    "STATIC",
-    "FRAME",
-    "SEGMENT",
-    "VECTOR",
-    "MODULE",
-    "INDEX",
-    "LEVEL",
-    "PHASE",
-    "PULSE",
-    "RANGE",
-    "TIMER",
-    "COUNT",
-    "LABEL",
-)
-# Fragments Roblox's text filter commonly tags, including ones a random token can spell by accident.
+# Fragments Roblox's text filter commonly tags.
 _BIO_BLOCKED = (
     "ass",
     "damn",
@@ -436,84 +747,92 @@ _BIO_BLOCKED = (
 )
 
 
-def glitch_bio(length: int | None = None, rng: random.Random | None = None) -> str:
-    """One line of terminal noise, 500 to 1000 characters, with OPSEC near the start.
+_PACKET_OPENERS = ("RBX_NET", "RBX_FRAME", "NET_TRACE", "FRAME_LINK", "RBX_LINK", "TRACE_NET")
+_PACKET_FIELDS = (
+    ("SESSION", "hex", 8),
+    ("CLIENT_ID", "hex", 6),
+    ("CHANNEL", "word", ("RELIABLE", "ORDERED")),
+    ("PACKET_ID", "hex", 4),
+    ("SEQUENCE", "int", 6),
+    ("REPLICATION", "hex", 6),
+    ("INSTANCE_REF", "hex", 6),
+    ("STREAM", "word", ("DATA_MODEL", "CLIENT_REP")),
+    ("PAYLOAD", "hex", 12),
+    ("TIMESTAMP", "int", 10),
+    ("ACK", "hex", 4),
+    ("BUFFER", "hex", 8),
+    ("STATE", "word", ("SYNC_PENDING", "SYNC_READY")),
+    ("FLAGS", "hex", 2),
+)
+_BIO_CHARS = set("0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZx_:[]")
 
-    Every word is taken from a fixed list. Digits and underscores fill the rest.
-    No random letters, so a chunk cannot spell a word the list does not contain.
+
+def glitch_bio(length: int | None = None, rng: random.Random | None = None) -> str:
+    """One replication-log line. Field order and values change every call.
+
+    `length` is accepted so older callers still work. The packet stays on one
+    line and within 1000 characters, which is Roblox's description limit.
     """
     picker = rng or random.SystemRandom()
-    target = picker.randint(500, 1000) if length is None else length
-    target = min(1000, max(500, int(target)))
-    for _ in range(30):
-        text = _assemble_bio(picker, target)
-        if _bio_is_plain(text) and "OPSEC" in text[:90]:
-            return text
-    return ("NULL_" * 200)[:target]
-
-
-def _assemble_bio(rng: random.Random, target: int) -> str:
-    chunks: list[str] = []
-    built = 0
-    while built < target:
-        chunk = _safe_chunk(rng)
-        chunks.append(chunk)
-        built += len(chunk)
-    text = "".join(chunks)
-    breaks = [index for index, char in enumerate(text) if char == "_" and index <= 80]
-    if breaks:
-        spot = rng.choice(breaks) + 1
-        text = text[:spot] + "OPSEC_" + text[spot:]
-    else:
-        text = "OPSEC_" + text
-    while len(text) < target:
-        text += _safe_chunk(rng)
-    if len(text) > target:
-        cut = text.rfind("_", 0, target + 1)
-        if cut >= 500:
-            text = text[:cut]
-    if len(text) > 1000:
-        text = text[: text.rfind("_", 0, 1001)]
-    return text
-
-
-def _safe_chunk(rng: random.Random) -> str:
+    del length
     for _ in range(20):
-        chunk = _glitch_chunk(rng)
-        if _bio_is_plain(chunk):
-            return chunk
-    return f"NULL_{rng.randint(0, 9999):04d}_"
+        text = _packet_bio(picker)
+        if _bio_is_safe(text):
+            return text
+    return _safe_bio(picker)
 
 
-def _bio_is_plain(text: str) -> bool:
-    if any(not (char.isalnum() or char == "_") for char in text):
+def _packet_bio(rng: random.Random) -> str:
+    required = {"SESSION", "CHANNEL", "PACKET_ID"}
+    chosen = [field for field in _PACKET_FIELDS if field[0] in required]
+    optional = [field for field in _PACKET_FIELDS if field[0] not in required]
+    rng.shuffle(optional)
+    chosen.extend(optional[: rng.randint(5, len(optional))])
+    rng.shuffle(chosen)
+    parts = [rng.choice(_PACKET_OPENERS)]
+    for name, kind, spec in chosen:
+        parts.append(f"{name}[{_packet_value(rng, kind, spec)}]")
+    parts.append("END")
+    return "::".join(parts)[:1000]
+
+
+def _packet_value(rng: random.Random, kind: str, spec: Any) -> str:
+    if kind == "hex":
+        return "0x" + _hex(rng, int(spec))
+    if kind == "int":
+        width = int(spec)
+        return f"{rng.randint(0, 10**width - 1):0{width}d}"
+    return rng.choice(spec)
+
+
+def _safe_bio(rng: random.Random) -> str:
+    parts = [
+        "RBX_NET",
+        f"SESSION[0x{_hex(rng, 8)}]",
+        f"CLIENT_ID[0x{_hex(rng, 6)}]",
+        "CHANNEL[RELIABLE]",
+        f"PACKET_ID[0x{_hex(rng, 4)}]",
+        f"SEQUENCE[{rng.randint(0, 999999):06d}]",
+        f"REPLICATION[0x{_hex(rng, 6)}]",
+        f"STREAM[DATA_MODEL]",
+        f"PAYLOAD[0x{_hex(rng, 12)}]",
+        f"STATE[SYNC_PENDING]",
+        "END",
+    ]
+    return "::".join(parts)
+
+
+def _hex(rng: random.Random, digits: int) -> str:
+    return "".join(rng.choice("0123456789ABCDEF") for _ in range(digits))
+
+
+def _bio_is_safe(text: str) -> bool:
+    if not text.startswith(_PACKET_OPENERS) or not text.endswith("::END"):
+        return False
+    if len(text) > 1000 or any(char not in _BIO_CHARS for char in text):
         return False
     lowered = text.lower()
     return not any(fragment in lowered for fragment in _BIO_BLOCKED)
-
-
-def _glitch_chunk(rng: random.Random) -> str:
-    kind = rng.randrange(4)
-    number = f"{rng.randint(0, 9999):03d}"
-    if kind == 0:
-        wrap = rng.choice(("xX", "Xx"))
-        return f"{wrap}_{_cased_stem(rng)}_{number}_"
-    if kind == 1:
-        return f"{_cased_stem(rng)}_{_cased_stem(rng)}_{number}_"
-    if kind == 2:
-        return "NULL_" * rng.randint(2, 4) + f"{number}_"
-    return f"{_cased_stem(rng)}_{number}_"
-
-
-def _cased_stem(rng: random.Random) -> str:
-    word = rng.choice(_BIO_STEMS)
-    styles = (
-        word,
-        word.lower(),
-        word.capitalize(),
-        "".join(rng.choice((char.lower(), char.upper())) for char in word),
-    )
-    return rng.choice(styles)
 
 
 def roblox_error_text(payload: Any, fallback: str) -> str:
