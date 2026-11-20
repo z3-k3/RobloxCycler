@@ -579,10 +579,20 @@ def freaky_avatar(
     colors = _clashing_colors(rules.get("colors") or [], rng)
     limits = rules.get("limits") if isinstance(rules.get("limits"), dict) else {}
     refine = rules.get("refine") if isinstance(rules.get("refine"), dict) and rules.get("refine") else _DEFAULT_REFINE
-    full = _pick_assets(grouped, limits, rng, stacked=True, blocked=blocked or set(), refine=refine)
+    r6 = bool(grouped.get(17)) and rng.random() < 0.33
+    full = _pick_assets(
+        grouped,
+        limits,
+        rng,
+        stacked=True,
+        blocked=blocked or set(),
+        refine=refine,
+        r6=r6,
+    )
+    avatar_type = 1 if r6 else 3
     return {
-        "body": _avatar_body(full, scales, colors),
-        "fallback": _avatar_body(full, scales, colors),
+        "body": _avatar_body(full, scales, colors, avatar_type),
+        "fallback": _avatar_body(full, scales, colors, avatar_type),
         "scales": scales,
         "colors": colors,
         "asset_count": len(full),
@@ -678,6 +688,7 @@ def _pick_assets(
     stacked: bool,
     blocked: set[int] | None = None,
     refine: dict[int, dict[str, dict[str, tuple[float, float]]]] | None = None,
+    r6: bool = False,
 ) -> list[dict[str, Any]]:
     chosen: list[dict[str, Any]] = []
     used: set[int] = set()
@@ -698,15 +709,21 @@ def _pick_assets(
             used.add(asset_id)
             chosen.append(_cursed_asset(type_id, asset_id, rng, bounds))
 
-    head_type = 79 if grouped.get(79) and (not grouped.get(17) or rng.random() < 0.75) else 17
-    if not grouped.get(head_type):
-        head_type = 17 if grouped.get(17) else 79
+    if r6:
+        head_type = 17
+    else:
+        head_type = 79 if grouped.get(79) and (not grouped.get(17) or rng.random() < 0.75) else 17
+        if not grouped.get(head_type):
+            head_type = 17 if grouped.get(17) else 79
     take(head_type, 1, allow_banned=True)
     for type_id in BODY_PART_TYPES:
         take(type_id, 1, allow_banned=True)
     if rng.random() < 0.3:
         take(18, 1, allow_banned=True)
     if not stacked:
+        return chosen
+    if r6:
+        take(8, limits.get(8, 3) if isinstance(limits.get(8, 3), int) else 3, allow_banned=False)
         return chosen
     for type_id in STACK_TYPES:
         cap = limits.get(type_id, 1)
@@ -750,9 +767,10 @@ def _avatar_body(
     assets: list[dict[str, Any]],
     scales: dict[str, float],
     colors: dict[str, str],
+    avatar_type: int = 3,
 ) -> dict[str, Any]:
-    model: dict[str, Any] = {"playerAvatarType": 3}
-    if scales:
+    model: dict[str, Any] = {"playerAvatarType": avatar_type}
+    if scales and avatar_type != 1:
         model["scales"] = scales
     if colors:
         model["bodyColors"] = colors

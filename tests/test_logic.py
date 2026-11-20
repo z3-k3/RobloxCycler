@@ -274,11 +274,18 @@ class FreakyAvatarTests(unittest.TestCase):
         second = freaky_avatar(grouped, rules, random.Random(2))
         self.assertNotEqual(first["body"], second["body"])
         for look in (first, second):
-            scales = look["body"]["avatarDefinition"]["updateAvatarModel"]["scales"]
-            self.assertIn(scales["height"], (0.9, 1.05))
-            self.assertIn(scales["width"], (0.7, 1.0))
-            self.assertIn(scales["proportion"], (0.0, 1.0))
-            self.assertIn(scales["bodyType"], (0.0, 1.0))
+            model = look["body"]["avatarDefinition"]["updateAvatarModel"]
+            if model["playerAvatarType"] == 3:
+                scales = model["scales"]
+                self.assertIn(scales["height"], (0.9, 1.05))
+                self.assertIn(scales["width"], (0.7, 1.0))
+                self.assertIn(scales["proportion"], (0.0, 1.0))
+                self.assertIn(scales["bodyType"], (0.0, 1.0))
+                self.assertNotEqual(scales["proportion"], scales["bodyType"])
+            else:
+                self.assertEqual(model["playerAvatarType"], 1)
+                self.assertNotIn("scales", model)
+                self.assertNotIn(79, [item["id"] for item in model["assets"]])
             colors = list(look["colors"].values())
             self.assertEqual(len(colors), 6)
             self.assertEqual(len(set(colors)), 6)
@@ -287,7 +294,6 @@ class FreakyAvatarTests(unittest.TestCase):
             self.assertLessEqual(sum(1 for asset_id in ids if asset_id in {70, 71, 72, 73}), 3)
             self.assertLessEqual(sum(1 for asset_id in ids if asset_id in {80, 81}), 1)
             self.assertTrue(any(asset_id in {10, 11} for asset_id in ids))
-            self.assertNotEqual(scales["proportion"], scales["bodyType"])
             hats = [item for item in look["body"]["avatarDefinition"]["updateAvatarModel"]["assets"] if item["id"] in {70, 71, 72, 73}]
             self.assertTrue(hats)
             for hat in hats:
@@ -333,6 +339,23 @@ class FreakyAvatarTests(unittest.TestCase):
             self.assertNotIn(900, ids)
             self.assertNotIn(910, ids)
             self.assertIn(10, ids)
+
+    def test_some_looks_are_r6(self) -> None:
+        import random
+
+        rules = parse_avatar_rules(
+            {
+                "scales": {"height": {"min": 0.9, "max": 1.05, "increment": 0.01}},
+                "wearableAssetTypes": [{"id": 8, "maxNumber": 3}],
+                "bodyColorsPalette": [{"hexColor": "#111111"}, {"hexColor": "#00FF00"}, {"hexColor": "#FF0000"}, {"hexColor": "#0000FF"}, {"hexColor": "#FF00BF"}, {"hexColor": "#FFFF00"}],
+            }
+        )
+        grouped = {17: [1], 79: [2], 27: [10], 28: [20], 29: [30], 30: [40], 31: [50], 8: [70], 64: [500]}
+        types = {
+            freaky_avatar(grouped, rules, random.Random(seed))["body"]["avatarDefinition"]["updateAvatarModel"]["playerAvatarType"]
+            for seed in range(40)
+        }
+        self.assertEqual(types, {1, 3})
 
 
 if __name__ == "__main__":

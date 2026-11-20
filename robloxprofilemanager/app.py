@@ -445,11 +445,13 @@ def _forget_assets(wardrobe: dict[str, Any], asset_ids: list[int]) -> None:
 
 
 def _look_label(look: dict[str, Any]) -> str:
+    model = look.get("body", {}).get("avatarDefinition", {}).get("updateAvatarModel", {})
+    kind = "R6" if model.get("playerAvatarType") == 1 else "R15"
     scales = look.get("scales") or {}
     scale_text = ", ".join(f"{name} {value:g}" for name, value in scales.items())
     colors = look.get("colors") or {}
     color_text = ", ".join(f"{name} {value}" for name, value in colors.items())
-    return f"{look.get('asset_count', 0)} items; {scale_text}; {color_text}"
+    return f"{kind}; {look.get('asset_count', 0)} items; {scale_text}; {color_text}"
 
 
 def _update_bio(
