@@ -166,6 +166,11 @@ def clamp_interval(seconds: float, maximum: float) -> float:
     return min(ceiling, max(MIN_INTERVAL_SECONDS, float(seconds)))
 
 
+def relax_bio_gap(current_gap: float, target: float) -> float:
+    """After Roblox accepts a bio, go back to the normal gap instead of staying slowed."""
+    return max(float(target), MIN_INTERVAL_SECONDS)
+
+
 def schedule_bio_after_limit(
     current_gap: float,
     retry_after: float | None,

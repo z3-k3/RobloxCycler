@@ -21,6 +21,7 @@ from robloxcycler.logic import (
     merge_outfits,
     normalize_cookie,
     read_config,
+    relax_bio_gap,
     save_json,
     schedule_bio_after_limit,
     select_outfits,
@@ -161,6 +162,12 @@ def run_loop(client: RobloxClient, selected: list[dict[str, Any]], config: dict[
             f"Using {interval:.0f}s between outfits because an earlier run was rate limited. "
             "python main.py reset goes back to config.json."
         )
+    saved_bio = state.get("bio_interval_seconds")
+    if isinstance(saved_bio, (int, float)) and not isinstance(saved_bio, bool) and float(saved_bio) > interval:
+        print(f"Bio gap was {float(saved_bio):.0f}s. Trying {interval:.0f}s again.")
+        state["bio_interval_seconds"] = interval
+        state["bio_next_at"] = None
+        _save_state(state)
     print(f"Cycling {len(selected)} outfits every {interval:.0f}s. Ctrl+C stops it.")
     print("A 429 makes the gap longer. A block on the account stops the program.")
     _log(f"start count={len(selected)} interval={interval:.0f}s")
@@ -300,7 +307,9 @@ def _update_bio(
         return "ok"
 
     gap = state.get("bio_interval_seconds")
-    bio_gap = float(gap) if isinstance(gap, (int, float)) and not isinstance(gap, bool) else interval
+    current_gap = float(gap) if isinstance(gap, (int, float)) and not isinstance(gap, bool) else interval
+    bio_gap = relax_bio_gap(current_gap, interval)
+    state["bio_interval_seconds"] = bio_gap
     state["bio_next_at"] = time.time() + bio_gap
     _save_state(state)
     print(f"Updated bio ({len(text)} chars). Next bio in {bio_gap:.0f}s.")
