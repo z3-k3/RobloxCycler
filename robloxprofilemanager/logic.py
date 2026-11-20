@@ -579,7 +579,7 @@ def freaky_avatar(
     colors = _clashing_colors(rules.get("colors") or [], rng)
     limits = rules.get("limits") if isinstance(rules.get("limits"), dict) else {}
     refine = rules.get("refine") if isinstance(rules.get("refine"), dict) and rules.get("refine") else _DEFAULT_REFINE
-    r6 = bool(grouped.get(17)) and rng.random() < 0.33
+    r6 = bool(grouped.get(17)) and rng.random() < 0.5
     full = _pick_assets(
         grouped,
         limits,
