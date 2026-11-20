@@ -443,6 +443,28 @@ _COLOR_FIELDS = (
     "rightLegColor",
     "leftLegColor",
 )
+# Accessory types Roblox lets you slide, twist, and resize. Front and back tilt less on X.
+_REFINE_TYPE_NAMES = {
+    8: "Hat",
+    42: "FaceAccessory",
+    43: "NeckAccessory",
+    44: "ShoulderAccessory",
+    45: "FrontAccessory",
+    46: "BackAccessory",
+}
+_LAYERED_TYPES = {64, 65, 66, 67, 68, 69, 72}
+_DEFAULT_REFINE = {
+    type_id: {
+        "position": {"X": (-0.25, 0.25), "Y": (-0.25, 0.25), "Z": (-0.25, 0.25)},
+        "rotation": {
+            "X": (-15.0, 15.0) if type_id in {45, 46} else (-30.0, 30.0),
+            "Y": (-30.0, 30.0),
+            "Z": (-30.0, 30.0),
+        },
+        "scale": {"X": (0.8, 1.2), "Y": (0.8, 1.2), "Z": (0.8, 1.2)},
+    }
+    for type_id in _REFINE_TYPE_NAMES
+}
 _SCALE_PRESETS = (
     {"height": "max", "width": "min", "head": "max", "proportion": "min", "bodyType": "max"},
     {"height": "max", "width": "min", "head": "min", "proportion": "max", "bodyType": "min"},
@@ -520,7 +542,7 @@ def parse_avatar_rules(payload: Any) -> dict[str, Any]:
     for item in payload.get("bodyColorsPalette") or []:
         if isinstance(item, dict) and isinstance(item.get("hexColor"), str) and item["hexColor"].strip():
             colors.append(item["hexColor"].strip())
-    return {"scales": scales, "limits": limits, "colors": colors}
+    return {"scales": scales, "limits": limits, "colors": colors, "refine": _parse_refine(payload)}
 
 
 def asset_ids_from_outfit(payload: Any) -> set[int]:
@@ -556,7 +578,8 @@ def freaky_avatar(
     scales = _extreme_scales(rules.get("scales") or {}, rng)
     colors = _clashing_colors(rules.get("colors") or [], rng)
     limits = rules.get("limits") if isinstance(rules.get("limits"), dict) else {}
-    full = _pick_assets(grouped, limits, rng, stacked=True, blocked=blocked or set())
+    refine = rules.get("refine") if isinstance(rules.get("refine"), dict) and rules.get("refine") else _DEFAULT_REFINE
+    full = _pick_assets(grouped, limits, rng, stacked=True, blocked=blocked or set(), refine=refine)
     return {
         "body": _avatar_body(full, scales, colors),
         "fallback": _avatar_body(full, scales, colors),
@@ -579,6 +602,12 @@ def _extreme_scales(scale_rules: dict[str, Any], rng: random.Random) -> dict[str
             chosen[name] = _snap_scale(spec, end)
         except (KeyError, TypeError, ValueError):
             continue
+    proportion = chosen.get("proportion")
+    if isinstance(proportion, float) and "bodyType" in chosen and "proportion" in scale_rules and "bodyType" in scale_rules:
+        prop_spec = scale_rules["proportion"]
+        body_spec = scale_rules["bodyType"]
+        midpoint = (_snap_scale(prop_spec, "min") + _snap_scale(prop_spec, "max")) / 2
+        chosen["bodyType"] = _snap_scale(body_spec, "min" if proportion >= midpoint else "max")
     return chosen
 
 
@@ -605,6 +634,42 @@ def _clashing_colors(palette: list[str], rng: random.Random) -> dict[str, str]:
     return {field: pool[index % len(pool)] for index, field in enumerate(_COLOR_FIELDS)}
 
 
+def _parse_refine(payload: dict[str, Any]) -> dict[int, dict[str, dict[str, tuple[float, float]]]]:
+    lower = payload.get("accessoryRefinementLowerBounds")
+    upper = payload.get("accessoryRefinementUpperBounds")
+    if not isinstance(lower, dict) or not isinstance(upper, dict):
+        return dict(_DEFAULT_REFINE)
+    names = {name: type_id for type_id, name in _REFINE_TYPE_NAMES.items()}
+    parsed: dict[int, dict[str, dict[str, tuple[float, float]]]] = {}
+    for name, type_id in names.items():
+        low = lower.get(name)
+        high = upper.get(name)
+        if not isinstance(low, dict) or not isinstance(high, dict):
+            continue
+        try:
+            parsed[type_id] = {
+                "position": _bound_pair(low, high, "position", ("xPosition", "X"), ("yPosition", "Y"), ("zPosition", "Z")),
+                "rotation": _bound_pair(low, high, "rotation", ("xRotation", "X"), ("yRotation", "Y"), ("zRotation", "Z")),
+                "scale": _bound_pair(low, high, "scale", ("xScale", "X"), ("yScale", "Y"), ("zScale", "Z")),
+            }
+        except (KeyError, TypeError, ValueError):
+            continue
+    return parsed or dict(_DEFAULT_REFINE)
+
+
+def _bound_pair(
+    low: dict[str, Any],
+    high: dict[str, Any],
+    group: str,
+    *axes: tuple[str, str],
+) -> dict[str, tuple[float, float]]:
+    low_group = low[group]
+    high_group = high[group]
+    if not isinstance(low_group, dict) or not isinstance(high_group, dict):
+        raise TypeError(group)
+    return {axis: (float(low_group[source]), float(high_group[source])) for source, axis in axes}
+
+
 def _pick_assets(
     grouped: dict[int, list[int]],
     limits: dict[Any, Any],
@@ -612,10 +677,12 @@ def _pick_assets(
     *,
     stacked: bool,
     blocked: set[int] | None = None,
-) -> list[tuple[int, int]]:
-    chosen: list[tuple[int, int]] = []
+    refine: dict[int, dict[str, dict[str, tuple[float, float]]]] | None = None,
+) -> list[dict[str, Any]]:
+    chosen: list[dict[str, Any]] = []
     used: set[int] = set()
     banned = blocked or set()
+    bounds = refine or _DEFAULT_REFINE
 
     def take(type_id: int, count: int, *, allow_banned: bool) -> None:
         pool = [asset_id for asset_id in grouped.get(type_id, []) if asset_id not in used]
@@ -629,7 +696,7 @@ def _pick_assets(
         rng.shuffle(pool)
         for asset_id in pool[:count]:
             used.add(asset_id)
-            chosen.append((type_id, asset_id))
+            chosen.append(_cursed_asset(type_id, asset_id, rng, bounds))
 
     head_type = 79 if grouped.get(79) and (not grouped.get(17) or rng.random() < 0.75) else 17
     if not grouped.get(head_type):
@@ -637,7 +704,8 @@ def _pick_assets(
     take(head_type, 1, allow_banned=True)
     for type_id in BODY_PART_TYPES:
         take(type_id, 1, allow_banned=True)
-    take(18, 1, allow_banned=True)
+    if rng.random() < 0.3:
+        take(18, 1, allow_banned=True)
     if not stacked:
         return chosen
     for type_id in STACK_TYPES:
@@ -647,14 +715,39 @@ def _pick_assets(
         except (TypeError, ValueError):
             cap = 1
         take(type_id, cap, allow_banned=False)
-    if rng.random() < 0.35:
-        take(11, 1, allow_banned=False)
-        take(12, 1, allow_banned=False)
     return chosen
 
 
+def _cursed_asset(
+    type_id: int,
+    asset_id: int,
+    rng: random.Random,
+    refine: dict[int, dict[str, dict[str, tuple[float, float]]]],
+) -> dict[str, Any]:
+    """Shove refinable items to a corner, puff layered clothes, and scramble dynamic heads."""
+    meta: dict[str, Any] = {"version": 1}
+    bounds = refine.get(type_id)
+    if bounds:
+        meta["position"] = _extreme_vector(rng, bounds["position"])
+        meta["rotation"] = _extreme_vector(rng, bounds["rotation"])
+        meta["scale"] = _extreme_vector(rng, bounds["scale"])
+    elif type_id in _LAYERED_TYPES:
+        meta["order"] = rng.randint(1, 8)
+        meta["puffiness"] = 1
+    elif type_id == 79:
+        meta["headShape"] = rng.randrange(30)
+        meta["staticFacialAnimation"] = False
+    else:
+        return {"id": asset_id}
+    return {"id": asset_id, "meta": meta}
+
+
+def _extreme_vector(rng: random.Random, axes: dict[str, tuple[float, float]]) -> dict[str, float]:
+    return {axis: rng.choice(pair) for axis, pair in axes.items()}
+
+
 def _avatar_body(
-    picks: list[tuple[int, int]],
+    assets: list[dict[str, Any]],
     scales: dict[str, float],
     colors: dict[str, str],
 ) -> dict[str, Any]:
@@ -663,8 +756,8 @@ def _avatar_body(
         model["scales"] = scales
     if colors:
         model["bodyColors"] = colors
-    if picks:
-        model["assets"] = [{"id": asset_id} for _, asset_id in picks]
+    if assets:
+        model["assets"] = assets
     return {"updateTypes": [0, 2, 3, 4], "avatarDefinition": {"updateAvatarModel": model}}
 
 

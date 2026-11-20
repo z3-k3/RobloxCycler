@@ -287,6 +287,13 @@ class FreakyAvatarTests(unittest.TestCase):
             self.assertLessEqual(sum(1 for asset_id in ids if asset_id in {70, 71, 72, 73}), 3)
             self.assertLessEqual(sum(1 for asset_id in ids if asset_id in {80, 81}), 1)
             self.assertTrue(any(asset_id in {10, 11} for asset_id in ids))
+            self.assertNotEqual(scales["proportion"], scales["bodyType"])
+            hats = [item for item in look["body"]["avatarDefinition"]["updateAvatarModel"]["assets"] if item["id"] in {70, 71, 72, 73}]
+            self.assertTrue(hats)
+            for hat in hats:
+                self.assertIn(hat["meta"]["position"]["X"], (-0.25, 0.25))
+                self.assertIn(hat["meta"]["rotation"]["Y"], (-30.0, 30.0))
+                self.assertIn(hat["meta"]["scale"]["Z"], (0.8, 1.2))
             self.assertEqual(
                 look["fallback"]["avatarDefinition"]["updateAvatarModel"]["assets"],
                 look["body"]["avatarDefinition"]["updateAvatarModel"]["assets"],
