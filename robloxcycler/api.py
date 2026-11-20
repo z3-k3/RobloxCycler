@@ -153,6 +153,14 @@ class RobloxClient:
             result.message = f"Roblox refused some items in this outfit ({len(invalid)} invalid)."
         return result
 
+    def set_description(self, description: str) -> CallResult:
+        text = description.replace("\n", "").replace("\r", "")[:1000]
+        return self._request(
+            "POST",
+            "https://users.roblox.com/v1/description",
+            json_body={"description": text},
+        )
+
     def _request(
         self,
         method: str,

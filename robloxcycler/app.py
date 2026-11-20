@@ -15,6 +15,7 @@ from robloxcycler.logic import (
     api_block_reason,
     is_avatar_outfit,
     cookie_from_text,
+    glitch_bio,
     load_dotenv,
     load_json,
     merge_outfits,
@@ -223,6 +224,12 @@ def run_loop(client: RobloxClient, selected: list[dict[str, Any]], config: dict[
         state["interval_seconds"] = interval
         _save_state(state)
 
+        bio_decision = _update_bio(client, state, config, interval, outfit)
+        if bio_decision == "stop":
+            return 1
+        if bio_decision == "wait":
+            continue
+
         extra = result.wait_seconds if result.ok else 0
         sleep_for = max(interval, extra)
         if extra > interval:
@@ -231,12 +238,53 @@ def run_loop(client: RobloxClient, selected: list[dict[str, Any]], config: dict[
         _sleep(sleep_for)
 
 
+def _update_bio(
+    client: RobloxClient,
+    state: dict[str, Any],
+    config: dict[str, Any],
+    interval: float,
+    outfit: dict[str, Any],
+) -> str:
+    """Set a new one-line bio. A 429 slows the cycle. Other bio errors do not stop it."""
+    text = glitch_bio()
+    try:
+        result = client.set_description(text)
+    except RobloxError as exc:
+        if exc.transient:
+            print(f"{exc} Waiting {interval:.0f}s.")
+            _log(f"bio-network-wait {exc}")
+            _sleep(interval)
+            return "wait"
+        print(exc)
+        _log(f"auth-stop {exc}")
+        return "stop"
+
+    if result.rate_limited:
+        decision = _record_rate_limit(result, state, config, interval, outfit, action="updating the bio")
+        return "stop" if decision == "stop" else "wait"
+
+    if result.status == 401:
+        print("The cookie expired. Paste a new .ROBLOSECURITY value into .env and start again.")
+        _log("cookie expired")
+        return "stop"
+
+    if not result.ok:
+        print(f"Bio was not changed: {result.status} {result.message}")
+        _log(f"bio-fail status={result.status} {result.message}")
+        return "ok"
+
+    print(f"Updated bio ({len(text)} chars). Next change in {interval:.0f}s.")
+    _log(f"bio status={result.status} len={len(text)}")
+    return "ok"
+
+
 def _record_rate_limit(
     result: Any,
     state: dict[str, Any],
     config: dict[str, Any],
     interval: float,
     outfit: dict[str, Any],
+    action: str | None = None,
 ) -> str:
     """Remember the 429, lengthen the gap, and either wait or ask the caller to exit.
 
@@ -258,7 +306,7 @@ def _record_rate_limit(
     state["last_status"] = 429
     _save_state(state)
     message = (
-        f"Rate limited while equipping \"{outfit['name']}\". "
+        f"Rate limited while {action or 'equipping \"' + outfit['name'] + '\"'}. "
         f"Pausing {pause_for:.0f}s and raising the interval from {interval:.0f}s to {new_interval:.0f}s."
     )
     print(message)

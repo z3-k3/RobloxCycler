@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import random
+import string
 from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any
@@ -359,6 +361,94 @@ def select_outfits(merged: list[dict[str, Any]], outfit_ids: list[int]) -> list[
                 chosen.append(item)
         return chosen
     return [item for item in merged if item.get("enabled", True)]
+
+
+_BIO_STEMS = (
+    "SYSTEM",
+    "UNKNOWN",
+    "VOID",
+    "ACCESS",
+    "ERROR",
+    "SIGNAL",
+    "LOST",
+    "NULL",
+    "TRACE",
+    "KERNEL",
+    "BUFFER",
+    "PACKET",
+    "OFFSET",
+    "SECTOR",
+    "HASH",
+    "NODE",
+    "RELAY",
+    "CIPHER",
+    "GHOST",
+    "STATIC",
+    "FRAME",
+    "DUMP",
+    "STACK",
+    "OPCODE",
+    "SEGMENT",
+    "CHECKSUM",
+)
+_BIO_SYMBOLS = "_|/\\#*+=~^[]<>"
+
+
+def glitch_bio(length: int | None = None, rng: random.Random | None = None) -> str:
+    """One line of fresh terminal noise, 500 to 1000 characters, with OPSEC near the start."""
+    picker = rng or random.SystemRandom()
+    target = picker.randint(500, 1000) if length is None else length
+    target = min(1000, max(500, int(target)))
+    chunks: list[str] = []
+    built = 0
+    while built < target:
+        chunk = _glitch_chunk(picker)
+        chunks.append(chunk)
+        built += len(chunk)
+    text = "".join(chunks)
+    spot = picker.randint(0, 80)
+    text = text[:spot] + "OPSEC" + text[spot:]
+    text = text.replace("\n", "").replace("\r", "")
+    if len(text) < target:
+        text += _glitch_chunk(picker)
+    return text[:target]
+
+
+def _glitch_chunk(rng: random.Random) -> str:
+    kind = rng.randrange(6)
+    if kind == 0:
+        left = _noise_token(rng, 3, 8)
+        right = _noise_token(rng, 3, 8)
+        wrap = rng.choice(("xX_", "_Xx"))
+        return f"{wrap}{left}_{right}"
+    if kind == 1:
+        return f"{_cased_stem(rng)}_{_cased_stem(rng)}_{rng.randint(0, 9999):03d}"
+    if kind == 2:
+        return "NULL_" * rng.randint(2, 4) + f"{rng.randint(0, 99):02d}"
+    if kind == 3:
+        digits = "".join(rng.choice(string.digits) for _ in range(rng.randint(3, 6)))
+        return f"ERROR_{digits}"
+    if kind == 4:
+        body = _noise_token(rng, 8, 24)
+        return rng.choice(_BIO_SYMBOLS) + body + rng.choice(_BIO_SYMBOLS)
+    return _cased_stem(rng) + rng.choice(_BIO_SYMBOLS) + _noise_token(rng, 2, 6)
+
+
+def _noise_token(rng: random.Random, shortest: int, longest: int) -> str:
+    alphabet = string.ascii_letters + string.digits + "_"
+    count = rng.randint(shortest, longest)
+    return "".join(rng.choice(alphabet) for _ in range(count))
+
+
+def _cased_stem(rng: random.Random) -> str:
+    word = rng.choice(_BIO_STEMS)
+    styles = (
+        word,
+        word.lower(),
+        word.capitalize(),
+        "".join(rng.choice((char.lower(), char.upper())) for char in word),
+    )
+    return rng.choice(styles)
 
 
 def roblox_error_text(payload: Any, fallback: str) -> str:

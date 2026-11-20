@@ -8,6 +8,7 @@ from robloxcycler.logic import (
     body_colors_payload,
     clamp_interval,
     cookie_from_text,
+    glitch_bio,
     header_wait_seconds,
     is_avatar_outfit,
     merge_outfits,
@@ -72,6 +73,23 @@ class RetryAfterTests(unittest.TestCase):
             header_wait_seconds({"x-ratelimit-remaining": "0", "x-ratelimit-reset": "1700000500"}, 1_700_000_000),
             500,
         )
+
+
+class BioTests(unittest.TestCase):
+    def test_each_bio_is_a_fresh_one_line_block(self) -> None:
+        import random
+
+        first = glitch_bio(rng=random.Random(1))
+        second = glitch_bio(rng=random.Random(2))
+        self.assertNotEqual(first, second)
+        for text in (first, second):
+            self.assertGreaterEqual(len(text), 500)
+            self.assertLessEqual(len(text), 1000)
+            self.assertNotIn("\n", text)
+            self.assertNotIn("\r", text)
+            self.assertIn("OPSEC", text[:90])
+            self.assertTrue(any(char.isdigit() for char in text))
+            self.assertIn("_", text)
 
 
 class OutfitTests(unittest.TestCase):
